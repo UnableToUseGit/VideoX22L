@@ -12,7 +12,7 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
-
+import random
 from typing import List, Optional, Tuple, Union, Dict
 import torch
 import torch.nn as nn
@@ -52,7 +52,9 @@ from transformers.integrations import is_deepspeed_zero3_enabled
 from .configuration_qwen2 import Qwen2Config
 from .modeling_beacon import Memory
 from videoxl.train.modeling_utils import optional_grad_ctx, compute_loss, BeaconModelOutput
-
+import pdb
+import psutil
+from loguru import logger as eval_logger
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
@@ -69,6 +71,10 @@ QWEN2_PRETRAINED_MODEL_ARCHIVE_LIST = [
     "Qwen/Qwen2-7B-beta",
     # See all Qwen2 models at https://huggingface.co/models?filter=qwen2
 ]
+
+def monitor_cpu_usage():
+    # 获取当前 CPU 使用率
+    return psutil.cpu_percent(interval=1)
 
 
 # Copied from transformers.models.llama.modeling_llama._get_unpad_data
@@ -699,6 +705,137 @@ class Qwen2SdpaAttention(Qwen2Attention):
     SDPA API.
     """
 
+    # 获取 attention weight
+    def scaled_dot_product_attention_for_reload_step1(self, query, key, scale=None) -> torch.Tensor:
+        
+        query = query.to(dtype=torch.float32)
+        key = key.to(dtype=torch.float32)
+        L, S = query.size(-2), key.size(-2)
+        scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
+
+        attn_weight = query @ key.transpose(-2, -1) * scale_factor
+        if torch.isnan(attn_weight).any():
+            eval_logger.info("attn_logits contains NaN values before softmax")
+            pdb.set_trace()
+        if torch.isinf(attn_weight).any():
+            eval_logger.info("attn_logits contains inf values before softmax")
+            pdb.set_trace()
+
+        # attn_weight += attn_bias.to(query.device)
+        attn_logits = torch.softmax(attn_weight, dim=-1, dtype=torch.float32).to(query.dtype)
+        if torch.isnan(attn_logits).any():
+            eval_logger.info("attn_logits contains NaN values after softmax")
+            pdb.set_trace()
+
+        return attn_weight, attn_logits
+
+    # 选取 top k chunk
+    def scaled_dot_product_attention_for_reload_step2(self, attn_logits, chunk_infos, top_k=3):
+        # 将每个视觉token对于文本token的attention进行求和
+        # eval_logger.debug(f'attn_logits: {attn_logits}')
+        eval_logger.debug(f'attn_logits.shape : {attn_logits.shape}')
+        attn_logits_sum = attn_logits.sum(dim=-2) # (batch_size, nheads, seqlen)
+        # eval_logger.debug(f'attn_logits_sum: {attn_logits_sum}')
+        eval_logger.debug(f'attn_logits_sum.shape : {attn_logits_sum.shape}')
+        attn_logits_avg = attn_logits_sum.mean(dim=1) # 将每个 head 求平均 (batch_size, seqlen)
+        # eval_logger.debug(f'attn_logits_avg: {attn_logits_avg}')
+        eval_logger.debug(f'attn_logits_avg.shape : {attn_logits_avg.shape}')
+
+        if torch.isnan(attn_logits).any():
+            eval_logger.info("attn_logits contains NaN values")
+        if torch.isinf(attn_logits).any():
+            eval_logger.info("attn_logits contains Inf values")
+
+
+        batch_chunk_avg = []
+        # 对 batch 维度逐一处理
+        for batch in attn_logits_avg:
+            # 保存当前 batch 的 chunk 平均值
+            chunk_avg = []
+            eval_logger.debug(f'batch.shape: {batch.shape}')
+            for chunk_idx, start, end in chunk_infos:
+                eval_logger.debug(f'start: {start}, end: {end}')
+                if start < 0 or end > attn_logits.shape[-1]:
+                    eval_logger.info(f"Invalid chunk range: start={start}, end={end}")
+                # 对当前 chunk 的元素取均值
+                if torch.isnan(batch[start: end]).any():
+                    eval_logger.info(f"NaN values found in chunk: {batch[start: end]}")
+                chunk_score = batch[start: end].mean()  
+                chunk_avg.append(chunk_score)
+            batch_chunk_avg.append(chunk_avg)
+            
+        # 转换为张量，形状为 (batch_size, n_chunks)
+        batch_chunk_avg = torch.tensor(batch_chunk_avg)
+        batch_chunk_avg = batch_chunk_avg.to(device=attn_logits_avg.device, dtype=attn_logits_avg.dtype)
+                    
+        if torch.isnan(batch_chunk_avg).any():
+            eval_logger.info("batch_chunk_avg contains NaN values before topk")
+
+        eval_logger.debug(f'batch_chunk_avg: {batch_chunk_avg}')
+        eval_logger.debug(f'batch_chunk_avg.shape: {batch_chunk_avg.shape}')
+
+        # chunk_infos 的数量 小于 k，全部纳入
+        if batch_chunk_avg.shape[-1] < top_k:
+            topk_values = batch_chunk_avg
+            topk_indices = torch.arange(batch_chunk_avg.shape[-1])
+            return topk_values, topk_indices
+
+        topk_values, topk_indices = torch.topk(batch_chunk_avg, k=top_k, dim=1)
+        eval_logger.debug(f'topk_values: {topk_values}')
+        eval_logger.debug(f'topk_indices: {topk_indices}')
+        # batch_size = 1
+        return topk_values, topk_indices[0] 
+
+
+    def scaled_dot_product_attention_manual(self, query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None) -> torch.Tensor:
+        L, S = query.size(-2), key.size(-2)
+        scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
+        attn_bias = torch.zeros(attn_mask.shape, dtype=query.dtype, device=query.device)
+        if is_causal:
+            assert attn_mask is None
+            temp_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0)
+            attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+            attn_bias.to(query.dtype)
+
+        if attn_mask is not None:
+            if attn_mask.dtype == torch.bool:
+                attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
+            else:
+                attn_bias += attn_mask
+        attn_weight = query @ key.transpose(-2, -1) * scale_factor
+            
+        attn_weight += attn_bias.to(query.device)
+        attn_weight = torch.softmax(attn_weight, dim=-1)
+        attn_logits = attn_weight
+
+        attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
+        return attn_weight @ value, attn_logits
+
+    def print_info(self, record_for_print):
+        # ANSI escape code for green text
+        GREEN = '\033[92m'
+        RESET = '\033[0m'
+
+        eval_logger.info(GREEN + '='*100 + RESET)
+
+        layer_idx = record_for_print['layer_idx']
+        all_chunks = record_for_print['all_chunks']
+        topk_indices = record_for_print['topk_indices']
+        topk_values = record_for_print['topk_values']
+        original_kv_seq_length = record_for_print['original_kv_seq_length']
+        now_kv_seq_length = record_for_print['now_kv_seq_length']
+
+        # Printing log messages in green
+        eval_logger.info(f'{GREEN}Layer_Idx: {layer_idx}{RESET}')
+        eval_logger.info(f'{GREEN}Total Chunks Num: {len(all_chunks)}{RESET}')
+        eval_logger.info(f'{GREEN}Chunks: {all_chunks}{RESET}')
+        eval_logger.info(f'{GREEN}topk_values: {topk_values}{RESET}')
+        eval_logger.info(f'{GREEN}topk_indices: {topk_indices}{RESET}')
+        eval_logger.info(f'{GREEN}original_kv_seq_length: {original_kv_seq_length}{RESET}')
+        eval_logger.info(f'{GREEN}now_kv_seq_length: {now_kv_seq_length}{RESET}')
+
+        eval_logger.info(GREEN + '='*100 + RESET)
+
     # Adapted from Qwen2Attention.forward
     def forward(
         self,
@@ -708,7 +845,10 @@ class Qwen2SdpaAttention(Qwen2Attention):
         past_key_value: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        memory=None,
+        layer_idx=None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+
         if output_attentions:
             # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
             logger.warning_once(
@@ -747,6 +887,14 @@ class Qwen2SdpaAttention(Qwen2Attention):
             key_states = torch.cat([past_key, key_states], dim=2)
             value_states = torch.cat([past_value, value_states], dim=2)
         
+        # NOTE: custom code
+        # print("TAG_3 Before func1 CPU usage:", monitor_cpu_usage())
+        if memory.reload_enable:
+            original_query_states = query_states
+            original_key_states = key_states.cpu()
+            original_value_states = value_states.cpu()
+        # print("TAG_3 After func1 CPU usage:", monitor_cpu_usage())
+
         query_states, key_states = self.rotary_emb(query_states, key_states, position_ids)
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -765,20 +913,170 @@ class Qwen2SdpaAttention(Qwen2Attention):
             key_states = key_states.contiguous()
             value_states = value_states.contiguous()
 
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
-            query_states,
-            key_states,
-            value_states,
-            attn_mask=attention_mask,
-            dropout_p=self.attention_dropout if self.training else 0.0,
-            # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create a causal mask in case q_len == 1.
-            is_causal=self.is_causal and attention_mask is None and q_len > 1,
-        )
+        if memory.prefill_finished and not memory.has_reloaded and memory.reload_enable and layer_idx in [0, 1, 2, 14, 15, 16, 25, 26, 27]:
+
+            record_for_print = {
+                'layer_idx':layer_idx,
+                'all_chuanks':None,
+                'topk_indices':None,
+                'topk_values':None,
+                'original_kv_seq_length':None,
+                'now_kv_seq_length':None,
+            }
+
+            eval_logger.debug('进入prefill的最后一步，此时query是 instructin，需要进行检索')
+            this_layer_offload_activations = memory.offload_activations[layer_idx]
+            eval_logger.debug(f'载入这一层，之前存储的 raw kv')
+            eval_logger.debug(f'一共有：{len(this_layer_offload_activations)}')
+            for idx, tmp in enumerate(this_layer_offload_activations):
+                eval_logger.debug(f'chunk: {idx} shape: {tmp[0].shape}')
+            
+            # if layer_idx==27:
+            #     pdb.set_trace()
+            # print("layer_idx:", layer_idx)
+            # print("query max:", query_states.max(), "query min:", query_states.min())
+            # print("key max:", key_states.max(), "key_states min:", key_states.min())
+            # get attn score
+            attn_weight, attn_logits = self.scaled_dot_product_attention_for_reload_step1(
+                query_states,
+                key_states,
+            )
+            # print("attn_weight max before softmax:", attn_weight.max())
+            # print("attn_weight min before softmax:", attn_weight.min())
+
+            
+            eval_logger.debug('打印chunk info:')
+            for chunk_info in memory.chunk_infos[1:-1]: 
+                eval_logger.debug(chunk_info)
+
+            # TODO: fix this, the last one is usually insturction, so this isn't should be included into chunk_infos
+            # TODO need to fix,  the first chunk is not always skip. need a more wisely stragedy
+            effective_chunk_infos = memory.chunk_infos[1:-1]
+            eval_logger.debug(f'effective_chunk_infos: {effective_chunk_infos}')
+            record_for_print['all_chunks'] = effective_chunk_infos
+
+            topk_values, topk_indices = self.scaled_dot_product_attention_for_reload_step2(attn_logits, effective_chunk_infos, top_k=memory.reload_top_k)
+
+            # random mode
+            # topk_indices = random.sample(range(len(effective_chunk_infos)), memory.reload_top_k)
+
+            record_for_print['topk_values'] = topk_values
+            record_for_print['topk_indices'] = topk_indices
+
+            key_states_with_reload = original_key_states
+            val_states_with_reload = original_value_states
+
+            for indice in topk_indices:
+                eval_logger.debug('*'*100)
+                chunk_info = effective_chunk_infos[indice]
+                eval_logger.debug(f'当前选中的 chunk: {chunk_info}')
+                chunk_idx_selected = chunk_info[0]
+                start_idx = chunk_info[1]
+                end_idx = chunk_info[2]
+                # insert these retrieved chunk activation into current
+                this_chunk_raw_activation = this_layer_offload_activations[chunk_idx_selected]
+                # get it
+                reload_k_states = this_chunk_raw_activation[0]
+                reload_v_states = this_chunk_raw_activation[-1]
+                # update beacon activation
+                eval_logger.debug('='*100)
+                eval_logger.debug(f'执行reload_kv_into_beacon_activation：')
+                memory.reload_kv_into_beacon_activation(reload_k_states, reload_v_states, chunk_info, layer_idx)
+                eval_logger.debug('='*100)
+                
+                # TODO 这里采用了一个更省事的做法，直接拼接 kv 然后后面重新进算 attn，但实际上可以避免重复计算已经计算的 attn weight，这一部分不知道对效率影响大不大，先实现简单版本。
+                # concat
+                eval_logger.debug(f'original_key_states.shape: {original_key_states.shape}')
+                key_states_with_reload = torch.cat((key_states_with_reload[:,:,:start_idx,:], reload_k_states, key_states_with_reload[:,:,start_idx:,:]), dim=2)
+                val_states_with_reload = torch.cat((val_states_with_reload[:,:,:start_idx,:], reload_v_states, val_states_with_reload[:,:,start_idx:,:]), dim=2)
+
+                eval_logger.debug(f'key_states_with_reload.shape: {key_states_with_reload.shape}')
+
+            # generate new attention mask for sdpa, and new_kv_seq_len
+            eval_logger.debug(f'original attention_mask.shape: {attention_mask.shape}')
+            tgt_size = attention_mask.shape[-2]
+            src_size = key_states_with_reload.shape[-2]
+
+            record_for_print['original_kv_seq_length'] = attention_mask.shape[-1]
+            record_for_print['now_kv_seq_length'] = src_size
+
+            self.print_info(record_for_print)
+
+            # mem_size meaning the size of reload memory exclude the current window
+            reload_mem_size = src_size - attention_mask.shape[-1]
+            reload_mem_attn = torch.ones(tgt_size, reload_mem_size, dtype=torch.bool, device=attention_mask.device)
+            
+            reload_mem_attn = reload_mem_attn[None, None, ...].expand(bsz, 1, tgt_size, reload_mem_size)
+
+            attention_mask = torch.cat([reload_mem_attn, attention_mask], dim=-1)
+
+            kv_seq_len = key_states_with_reload.shape[-2]
+            
+            eval_logger.debug(f'new attention_mask.shape: {attention_mask.shape}')
+            eval_logger.debug(f'new kv_seq_len.shape: {kv_seq_len}')
+
+            # allocate on GPU and attend calulate
+            # print("TAG_4 Before func1 CPU usage:", monitor_cpu_usage())
+            eval_logger.debug(f'dtype: {key_states_with_reload.dtype}')
+            eval_logger.debug(f'device: {key_states_with_reload.device}')
+            key_states_with_reload = key_states_with_reload.to(key_states.device)
+            val_states_with_reload = val_states_with_reload.to(key_states.device)
+            eval_logger.debug(f'dtype: {key_states_with_reload.dtype}')
+            eval_logger.debug(f'device: {key_states_with_reload.device}')
+            # print("TAG_4 Before func1 CPU usage:", monitor_cpu_usage())
+
+            # new position_ids TODO check its content
+            eval_logger.debug(f'original position_ids: {position_ids}')
+            position_ids = torch.arange(key_states_with_reload.shape[2], dtype=torch.long, device=key_states.device).repeat(key_states_with_reload.shape[0], 1)
+            eval_logger.debug(f'original position_ids: {position_ids}')
+
+            # The last layer
+            if layer_idx == self.config.num_hidden_layers-1:
+                memory.has_reloaded = True
+
+            query_states, key_states = self.rotary_emb(original_query_states, key_states_with_reload, position_ids)
+            value_states = val_states_with_reload
+
+            key_states = repeat_kv(key_states, self.num_key_value_groups)
+            value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+            if attention_mask is not None:
+                if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+                    raise ValueError(
+                        f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                    )
+
+            # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
+            # Reference: https://github.com/pytorch/pytorch/issues/112577.
+            if query_states.device.type == "cuda" and attention_mask is not None:
+                query_states = query_states.contiguous()
+                key_states = key_states.contiguous()
+                value_states = value_states.contiguous()
+
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                attn_mask=attention_mask,
+                dropout_p=self.attention_dropout if self.training else 0.0,
+                # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create a causal mask in case q_len == 1.
+                is_causal=self.is_causal and attention_mask is None and q_len > 1,
+            )
+
+        else:
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                attn_mask=attention_mask,
+                dropout_p=self.attention_dropout if self.training else 0.0,
+                # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create a causal mask in case q_len == 1.
+                is_causal=self.is_causal and attention_mask is None and q_len > 1,
+            )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
         attn_output = self.o_proj_with_beacon(attn_output, beacon_size, beacon_indices)
-
         return attn_output, None, past_key_value
 
 
@@ -805,11 +1103,13 @@ class Qwen2FlashAttention2(Qwen2Attention):
         past_key_value: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        memory = None,
+        layer_idx = None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         output_attentions = False
 
         bsz, q_len, _ = hidden_states.size()
-        kv_seq_len = hidden_states.shape[-2]
+        kv_seq_len = hidden_states.shape[-2]    
 
         past_key, past_value, beacon_size, beacon_indices = past_key_value
         if past_key is not None:
@@ -833,6 +1133,12 @@ class Qwen2FlashAttention2(Qwen2Attention):
             key_states = torch.cat([past_key, key_states], dim=2)
             value_states = torch.cat([past_value, value_states], dim=2)
 
+        # NOTE: custom code
+        if memory.reload_enable:
+            original_query_states = query_states
+            original_key_states = key_states.cpu()
+            original_value_states = value_states.cpu()
+    
         query_states, key_states = self.rotary_emb(query_states, key_states, position_ids)
 
         # FlashAttention will automatically handle grouped query attention
@@ -882,6 +1188,98 @@ class Qwen2FlashAttention2(Qwen2Attention):
             dropout=dropout_rate
         )
 
+        # in the last step of prefill, we shoud retreive more information
+        if memory.prefill_finished and not memory.has_reloaded and memory.reload_enable:
+            print('进入prefill的最后一步，此时query是 instructin，需要进行检索')
+            this_layer_offload_activations = memory.offload_activations[layer_idx]
+            eval_logger.debug(f'载入这一层，之前存储的 raw kv')
+            eval_logger.debug(f'一共有：{len(this_layer_offload_activations)}')
+            for idx, tmp in enumerate(this_layer_offload_activations):
+                eval_logger.debug(f'chunk: {idx} shape: {tmp[0].shape}')
+            
+            print('打印chunk info:')
+            for chunk_info in memory.chunk_infos[:-1]: # TODO: fix this, the last one is usually insturction, so this isn't should be included into chunk_infos
+                print(chunk_info)
+
+            chunk_len = len(memory.chunk_infos) - 1
+            chunk_idx_selected = random.randint(1, chunk_len-1) # TODO need to fix,  the first chunk is not always skip. need a more wisely stragedy
+            eval_logger.debug(f'随机选中的 chunk: {chunk_idx_selected}')
+            chunk_info = memory.chunk_infos[chunk_idx_selected]
+            eval_logger.debug(f'随机选中的 chunk: {chunk_info}')
+            start_idx = chunk_info[1]
+            end_idx = chunk_info[2]
+
+            # insert these retrieved chunk activation into current
+            this_chunk_raw_activation = this_layer_offload_activations[chunk_idx_selected]
+            # get it
+            reload_k_states = this_chunk_raw_activation[0]
+            reload_v_states = this_chunk_raw_activation[-1]
+            # update beacon activation
+            eval_logger.debug(f'执行reload_kv_into_beacon_activation：')
+            memory.reload_kv_into_beacon_activation(reload_k_states, reload_v_states, chunk_info, layer_idx)
+            
+            # concat
+            eval_logger.debug(f'original_key_states.shape: {original_key_states.shape}')
+            key_states_with_reload = torch.cat((original_key_states[:,:,:start_idx,:], reload_k_states, original_key_states[:,:,start_idx:,:]), dim=2)
+            val_states_with_reload = torch.cat((original_value_states[:,:,:start_idx,:], reload_v_states, original_value_states[:,:,start_idx:,:]), dim=2)
+
+            eval_logger.debug(f'key_states_with_reload.shape: {key_states_with_reload.shape}')
+
+            # allocate on GPU and attend calulate
+            eval_logger.debug(f'dtype: {key_states_with_reload.dtype}')
+            eval_logger.debug(f'device: {key_states_with_reload.device}')
+            key_states_with_reload = key_states_with_reload.to(key_states.device)
+            val_states_with_reload = val_states_with_reload.to(key_states.device)
+            eval_logger.debug(f'dtype: {key_states_with_reload.dtype}')
+            eval_logger.debug(f'device: {key_states_with_reload.device}')
+
+            # new position_ids TODO check its content
+            eval_logger.debug(f'original position_ids: {position_ids}')
+            position_ids = torch.arange(key_states_with_reload.shape[2], dtype=torch.long, device=key_states.device).repeat(key_states_with_reload.shape[0], 1)
+            eval_logger.debug(f'original position_ids: {position_ids}')
+
+            # The last layer
+            if layer_idx == self.config.num_hidden_layers-1:
+                memory.has_reloaded = True
+
+            query_states, key_states = self.rotary_emb(original_query_states, key_states_with_reload, position_ids)
+            value_states = val_states_with_reload
+
+            query_states = query_states.transpose(1, 2)
+            key_states = key_states.transpose(1, 2)
+            value_states = value_states.transpose(1, 2)
+
+            dropout_rate = self.attention_dropout if self.training else 0.0
+
+            input_dtype = query_states.dtype
+            if input_dtype == torch.float32:
+                if torch.is_autocast_enabled():
+                    target_dtype = torch.get_autocast_gpu_dtype()
+                # Handle the case where the model is quantized
+                elif hasattr(self.config, "_pre_quantization_dtype"):
+                    target_dtype = self.config._pre_quantization_dtype
+                else:
+                    target_dtype = self.q_proj.weight.dtype
+
+                logger.warning_once(
+                    f"The input hidden states seems to be silently casted in float32, this might be related to"
+                    f" the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in"
+                    f" {target_dtype}."
+                )
+
+                query_states = query_states.to(target_dtype)
+                key_states = key_states.to(target_dtype)
+                value_states = value_states.to(target_dtype)
+
+            attn_output, softmax_lse, S_dmask = self._flash_attention_forward(
+                query_states, 
+                key_states, 
+                value_states, 
+                attention_mask, 
+                q_len, 
+                dropout=dropout_rate
+            )
+           
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
         attn_output = self.o_proj_with_beacon(attn_output, beacon_size, beacon_indices)
 
@@ -1047,6 +1445,14 @@ class Qwen2DecoderLayer(nn.Module):
 
         hidden_states = self.input_layernorm(hidden_states)
 
+        # NOTE: custom code
+        if 'memory' in kwargs:
+            memory = kwargs['memory']
+        else:
+            memory = None
+
+        layer_idx = kwargs['layer_idx']
+
         ###add
         # attention_mask = attention_mask.float()
         # Self Attention
@@ -1057,6 +1463,8 @@ class Qwen2DecoderLayer(nn.Module):
             past_key_value=past_key_value,
             output_attentions=output_attentions,
             use_cache=use_cache,
+            memory = memory,
+            layer_idx = layer_idx
         )
         hidden_states = residual + hidden_states
 
@@ -1216,6 +1624,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         self.beacon_embed_tokens = nn.Embedding(1, config.hidden_size, self.padding_idx)
         self.beacon_embed_tokens._is_hf_initialized = True
 
+        print(f"_attn_implementation: {config._attn_implementation}")
         self.layers = nn.ModuleList(
             [Qwen2DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
@@ -1269,7 +1678,9 @@ class Qwen2Model(Qwen2PreTrainedModel):
         self,
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
+        attention_mask_all_layers=None,
         position_ids: Optional[torch.LongTensor] = None,
+        position_ids_all_layers=None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
@@ -1277,6 +1688,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         image_features:Optional[torch.Tensor] = None,
+        memory = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1389,6 +1801,10 @@ class Qwen2Model(Qwen2PreTrainedModel):
         next_decoder_cache = () if use_cache else None
 
         for idx, decoder_layer in enumerate(self.layers):
+
+            position_ids = position_ids_all_layers[idx]
+            attention_mask = attention_mask_all_layers[idx]
+
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -1413,6 +1829,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     past_key_value=past_key_value,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
+                    memory = memory,
+                    layer_idx = idx
                 )
 
             hidden_states = layer_outputs[0]
@@ -1494,6 +1912,8 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
     @classmethod
     def from_pretrained(cls, *args, **kwargs):
         """Override the default from_pretrained to extend vocab size according to beacon_size."""
+        reload_enable = kwargs.pop('reload_enable', False)
+        reload_top_k = kwargs.pop('reload_top_k', 3)
         kwargs.update(output_loading_info=True)
         model, loading_info = super().from_pretrained(*args, **kwargs)
 
@@ -1503,6 +1923,8 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             model_config=config,
             k_seq_dim=2,
             v_seq_dim=2,
+            reload_enable=reload_enable,  
+            reload_top_k=reload_top_k
         )
 
         missing_keys = loading_info["missing_keys"]
@@ -1520,7 +1942,9 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         self,
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
+        attention_mask_all_layers=None,
         position_ids: Optional[torch.LongTensor] = None,
+        position_ids_all_layers=None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
@@ -1546,14 +1970,17 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            attention_mask_all_layers=attention_mask_all_layers,
             position_ids=position_ids,
+            position_ids_all_layers=position_ids_all_layers,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            image_features=image_features
+            image_features=image_features,
+            memory=self.memory
         )
 
         hidden_states = outputs[0]
@@ -1619,15 +2046,31 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         while not self.memory.finish:
 
             # t3 = time.time()
-
-            input_ids, attention_mask, position_ids, past_key_values, labels = self.memory.step()
+            # 第一次 input_ids 是14，是 skip beacon的长度，past_key_values是28, 每个元素是这个形式 (None, None, 0, tensor([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], device='cuda:0')) 28是28层model layer的意思，其中四个元素的意思是 past_key, past_value, beacon_size, beacon_indices
+            # pdb.set_trace()
+            input_ids, attention_mask_all_layers, position_ids_all_layers, past_key_values, labels = self.memory.step()
 
             # t4 = time.time()
-            # print("step_input",input_ids)
+            # print("step_input: ",input_ids)
+            eval_logger.debug("#"*100)
+            eval_logger.debug(f"step_input length: {input_ids.shape}")
+            eval_logger.debug(f"beacon number: {past_key_values[0][-2]}")
+            if past_key_values[0][0] is not None:
+                eval_logger.debug(f"past key states shape: {past_key_values[0][0].shape}")
+            for idx, position_ids in enumerate(position_ids_all_layers):
+                eval_logger.debug(f'layer idx: {idx} position_ids: {position_ids[0][0]} - {position_ids[0][-1]}')
+                break
+            for idx, attn_mask in enumerate(attention_mask_all_layers):
+                if attn_mask is not None:
+                    eval_logger.debug(f'layer idx: {idx} attn_mask.shape: {attn_mask.shape}')
+                break
+
             outputs = self._native_forward(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
+                attention_mask_all_layers=attention_mask_all_layers,
                 position_ids=position_ids,
+                position_ids_all_layers=position_ids_all_layers,
                 past_key_values=past_key_values,
                 inputs_embeds=inputs_embeds,
                 use_cache=use_cache,
@@ -1641,7 +2084,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             )
 
             # t5 = time.time()
-
+            eval_logger.debug(f"output.past_key_values[0]:  {outputs.past_key_values[0][0].shape}")
             # update past_key_values
             self.memory.update_memory(outputs.past_key_values)
 
@@ -1688,7 +2131,6 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         dpo_forward: Optional[bool] = False,
         cache_position=None,
         ) -> Union[Tuple, CausalLMOutputWithPast]:
-
         
         if image_features is None:
             if input_ids.shape[1] != 1:

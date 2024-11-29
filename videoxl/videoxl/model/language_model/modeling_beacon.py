@@ -8,8 +8,14 @@ from transformers.utils import logging
 from transformers import AutoTokenizer
 from itertools import cycle
 from typing import List
-
+import pdb
+import psutil
+from loguru import logger as eval_logger
 logger = logging.get_logger(__name__)
+
+def monitor_cpu_usage():
+    # 获取当前 CPU 使用率
+    return psutil.cpu_percent(interval=1)
 
 
 class Memory(torch.nn.Module):
@@ -18,10 +24,11 @@ class Memory(torch.nn.Module):
         model_config, 
         k_seq_dim:int=2, 
         v_seq_dim:int=2, 
+        reload_enable = False,
+        reload_top_k = 3,
     ):
         """Setup necessary attributes."""
         super().__init__()
-
         self.config = model_config
 
         # initialize necessary parameters
@@ -29,8 +36,18 @@ class Memory(torch.nn.Module):
         self.v_seq_dim = v_seq_dim
         self.rng = np.random.default_rng(42)
 
+        self.reload_enable = reload_enable
+        if self.reload_enable:
+            print("启用 reload 机制")
+        else:
+            print("禁用 reload 机制")
+
         self._post_validation()
         self.reset()
+        # consist of (chunk_id, start_indice, end_indice)
+        self.chunk_infos = []
+        self.reload_top_k = reload_top_k
+        print(f'使用的 top_k={self.reload_top_k}')
     
     @property
     def beacon_token(self):
@@ -104,6 +121,16 @@ class Memory(torch.nn.Module):
         # the beacon activations
         self.beacon_activations = [(None, None) for _ in range(self.config.num_hidden_layers)]
 
+        # NOTE:Custom code
+        # the offload activations
+        self.offload_activations = [[] for _ in range(self.config.num_hidden_layers)]
+        # the cached activations which selected to reload from the offload activations
+        # [[[k_states, v_states, chunkinfo], ...]...]
+        self.cached_activations = [[] for _ in range(self.config.num_hidden_layers)]
+        self.chunk_infos = []
+        self.has_reloaded = False
+        # self.prefill_finished = False
+
     @property
     def all_sequence_length(self):
         if self.all_input_ids is None:
@@ -122,6 +149,13 @@ class Memory(torch.nn.Module):
     def finish(self):
         is_finish = self.end_idx == self.all_sequence_length
         return is_finish
+
+    @property
+    def prefill_finished(self):
+        prefill_finished = self.end_idx == self.all_sequence_length
+        # NOTE: custom code
+        # A flag to represent the prefill has finished
+        return prefill_finished
 
     @property
     def dtype(self):
@@ -176,13 +210,41 @@ class Memory(torch.nn.Module):
             raw_memory_size += self.raw_activations[0][0].shape[self.k_seq_dim]
         return sink_memory_size, beacon_memory_size, raw_memory_size
 
+    # NOTE: reload from offload
+    def reload_kv_into_beacon_activation(self, k_states_reloaded, v_states_reloaded, chunk_info, layer_idx):
+        start_idx = chunk_info[1]
+        # print("TAG_1 Before func1 CPU usage:", monitor_cpu_usage())
+        k_states_reloaded = k_states_reloaded.to(self._device)
+        v_states_reloaded = v_states_reloaded.to(self._device)
+        # print("TAG_1 After func1 CPU usage:", monitor_cpu_usage())
+
+        eval_logger.debug(f'k_states_reloaded shape: {k_states_reloaded.shape}')
+
+        sink_key, sink_value = self.sink_activations[layer_idx]
+        beacon_key, beacon_value = self.beacon_activations[layer_idx]
+        k_activation = cat_tensor([sink_key, beacon_key], dim=self.k_seq_dim)
+        v_activation = cat_tensor([sink_value, beacon_value], dim=self.v_seq_dim)
+
+        eval_logger.debug(f'k_activation[:,:,:start_idx,:] shape: {k_activation[:,:,:start_idx,:].shape}')
+        eval_logger.debug(f'k_activation[:,:,start_idx:,:] shape: {k_activation[:,:,start_idx:,:].shape}')
+
+        k_activation_cat_reload = torch.cat((k_activation[:,:,:start_idx,:], k_states_reloaded, k_activation[:,:,start_idx:,:]), dim=2)
+        v_activation_cat_reload = torch.cat((v_activation[:,:,:start_idx,:], v_states_reloaded, v_activation[:,:,start_idx:,:]), dim=2)
+
+        eval_logger.debug(f'k_activation_cat_reload shape: {k_activation_cat_reload.shape}')
+        
+        beacon_key_cat_reload = k_activation_cat_reload[:,:,sink_key.shape[2]:,:]
+        beacon_value_cat_reload = v_activation_cat_reload[:,:,sink_key.shape[2]:,:]
+        # update
+        self.beacon_activations[layer_idx] = (beacon_key_cat_reload, beacon_value_cat_reload)
+        eval_logger.debug(f'更新后, self.beacon_activations[layer_idx]: {self.beacon_activations[layer_idx][0].shape}')
+
     def prepare(self, input_ids, attention_mask, labels, skip_first=None, skip_last=None):
         """
         Prepare inputs for the model. These inputs belong to the same sequence.
         """
         # assert input_ids.shape[0] == 1, "Make sure the batch size is 1!"
         # assert attention_mask is None or (attention_mask == 1).all(), "Make sure there is no padding!"
-
         self._device = input_ids.device
 
         # accumulate input_ids
@@ -424,7 +486,6 @@ class Memory(torch.nn.Module):
         #============================================#
         # Check whether the inputs fulfills a window.
         #============================================#
-
         # the starting position of the current window w.r.t. the start of the current input sequence
         start_idx = self.start_idx
         # the end position of the current window w.r.t. the start of the current input sequence
@@ -626,22 +687,54 @@ class Memory(torch.nn.Module):
         #============================================#
         # Prepare attention_mask and position_ids.
         #============================================#
-        first_key = past_key_values[0][0]
-        mem_size = first_key.shape[self.k_seq_dim] if first_key is not None else 0
-        if mem_size > 0:
-            attention_mask = torch.cat([attention_mask.new_ones(batch_size, mem_size), attention_mask], dim=1)
 
-        input_length = input_ids.shape[1]
-        position_ids = torch.arange(attention_mask.shape[-1], dtype=torch.long, device=self._device).repeat(batch_size, 1)
+        # first_key = past_key_values[0][0]
+        # mem_size = first_key.shape[self.k_seq_dim] if first_key is not None else 0
+        # if mem_size > 0:
+        #     attention_mask = torch.cat([attention_mask.new_ones(batch_size, mem_size), attention_mask], dim=1)
 
+        # input_length = input_ids.shape[1]
+        # position_ids = torch.arange(attention_mask.shape[-1], dtype=torch.long, device=self._device).repeat(batch_size, 1)
+
+        position_ids_all_layers = []
+        attention_mask_all_layers = []
+        mem_size_all_layers = []
+        for tmp in past_key_values:
+            tmp_attention_mask = attention_mask
+            first_key = tmp[0]
+            # first_key = past_key_values[0][0]
+            mem_size = first_key.shape[self.k_seq_dim] if first_key is not None else 0
+            mem_size_all_layers.append(mem_size)
+            if mem_size > 0:
+                tmp_attention_mask = torch.cat([attention_mask.new_ones(batch_size, mem_size), attention_mask], dim=1)
+
+            attention_mask_all_layers.append(tmp_attention_mask)
+
+            input_length = input_ids.shape[1]
+            position_ids = torch.arange(tmp_attention_mask.shape[-1], dtype=torch.long, device=self._device).repeat(batch_size, 1)
+            position_ids_all_layers.append(position_ids)
+
+        # TODO attention_mask is not important, so the value of attention_mask is meaningless here
         if self.config._attn_implementation == "flash_attention_2":
             assert self.config.beacon_attn == "full-coverage", f"Make sure to set beacon_attn='full-coverage' when using flash attention! Found {self.config.beacon_attn}."
             if 0 in attention_mask:
                 pass
             else:
+                attention_mask_all_layers = [None] * len(past_key_values)
                 attention_mask = None
+
         elif self.config._attn_implementation == "sdpa" and self.config.beacon_pos == "append" and beacon_size <= 0 and (input_length == 1 or mem_size == 0):
             attention_mask = None
+        elif self.config._attn_implementation == "sdpa":
+            # NOTE: the key point is that the attention mask may difference in different layers.
+            attention_mask_all_layers = [
+                self._make_4d_attention_mask_for_sdpa(
+                    attention_mask, 
+                    mem_size, 
+                    beacon_size, 
+                    compression_ratio,) 
+                    for attention_mask, mem_size in zip(attention_mask_all_layers, mem_size_all_layers)
+            ]
         else:
             attention_mask, position_ids = self._make_4d_attention_mask_and_position_ids(
                 attention_mask, 
@@ -684,7 +777,32 @@ class Memory(torch.nn.Module):
         # if x == "s":
         #     return
 
-        return input_ids, attention_mask, position_ids, past_key_values, labels
+        # NOTE: Custome code
+        # TODO: nedd to consider the situation: beacon_skip_first is None
+        # This is the first input chunk and self.beacon_skip_first is not None
+        # So the beacon activations are not used
+        # In the following iteration forward, the chunk size just is the len(input_ids)
+        if self.step_idx == 1 and self.beacon_skip_first is not None:
+            chunk_info = (0, 0, len(input_ids[0]))
+            self.chunk_infos.append(chunk_info)
+        # This is the last chunk after beacon_skip_last
+        elif self.beacon_skip_last is not None and start_idx >= self.beacon_skip_last:
+            chunk_idx = self.step_idx - 1
+            start_idx = self.chunk_infos[-1][-1]
+            end_idx = start_idx + len(input_ids[0])
+            chunk_info = (chunk_idx, start_idx, end_idx)
+            self.chunk_infos.append(chunk_info)
+        # Another chunk
+        else:
+            chunk_idx = self.step_idx - 1
+            start_idx = self.chunk_infos[-1][-1]
+            end_idx = start_idx + beacon_size   # the length of the chunk is the beacon size
+            chunk_info = (chunk_idx, start_idx, end_idx)
+            self.chunk_infos.append(chunk_info)
+
+        # return input_ids, attention_mask, position_ids, past_key_values, labels
+        return input_ids, attention_mask_all_layers, position_ids_all_layers, past_key_values, labels
+
 
     def update_memory(self, past_key_values):
         """
@@ -693,6 +811,15 @@ class Memory(torch.nn.Module):
         for layer_idx, (key, value, beacon_size, beacon_indices) in enumerate(past_key_values):
             # NOTE: the past_key_values are incrementally returned (only the new keys and values are returned)
             previous_raw_key, previous_raw_value = self.raw_activations[layer_idx]
+
+            # NOTE: custome code
+            if self.reload_enable:
+                # print("TAG_2 Before func1 CPU usage:", monitor_cpu_usage())
+                self.offload_activations[layer_idx].append([
+                    key.detach().cpu(),
+                    value.detach().cpu(),
+                ])
+                # print("TAG_2 Before func1 CPU usage:", monitor_cpu_usage())
 
             if self.beacon_skip_first is not None and self.sink_activations[layer_idx][0] is None:
                 assert key.shape[self.k_seq_dim] == self.beacon_skip_first
@@ -783,6 +910,38 @@ class Memory(torch.nn.Module):
             model_outputs["logits"] = logits[:, beacon_indices == 0]
 
         return model_outputs
+
+    def _make_4d_attention_mask_for_sdpa(
+        self, 
+        attention_mask, 
+        mem_size, 
+        beacon_size, 
+        compression_ratio, 
+    ):
+        """
+        Convert attention_mask into causal 4D attention_mask (batch_size, head_num, query_len, key_len).
+        """
+        tgt_size = attention_mask.size(-1) - mem_size
+        dtype = torch.bool
+        min_value = self.min_value
+        device = self._device
+        batch_size, src_size = attention_mask.size()
+
+        # square for memory, and lower triangular for input_ids
+        causal_mask = torch.full((tgt_size, tgt_size), False, dtype=dtype, device=device)
+        mask_cond = torch.arange(causal_mask.size(-1), device=device)
+        causal_mask.masked_fill_(mask_cond < (mask_cond + 1).view(causal_mask.size(-1), -1), True)
+        causal_mask = torch.cat([torch.ones(tgt_size, mem_size, dtype=dtype, device=device), causal_mask], dim=-1)
+        causal_mask = causal_mask[None, None, ...].expand(batch_size, 1, tgt_size, src_size)
+        # 1 for non-padding tokens
+        expand_mask = attention_mask[:, None, None, :].expand(batch_size, 1, tgt_size, src_size)
+        invert_mask = 1.0 - expand_mask
+        ###add
+        # invert_mask = ~ expand_mask
+        # invert_mask.masked_fill_(invert_mask.bool(), min_value)
+        attention_mask = causal_mask.masked_fill(invert_mask.bool(), False)
+        return attention_mask
+
 
     def _make_4d_attention_mask_and_position_ids(
         self, 
