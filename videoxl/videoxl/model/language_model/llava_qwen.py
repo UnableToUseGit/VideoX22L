@@ -734,7 +734,7 @@ class Qwen2SdpaAttention(Qwen2Attention):
         # 将每个视觉token对于文本token的attention进行求和
         # eval_logger.debug(f'attn_logits: {attn_logits}')
         eval_logger.debug(f'attn_logits.shape : {attn_logits.shape}')
-        attn_logits_sum = attn_logits.sum(dim=-2) # (batch_size, nheads, seqlen)
+        attn_logits_sum = attn_logits.sum(dim=-2) # (batch_size, nheads, q_seqlen, k_seqlen)
         # eval_logger.debug(f'attn_logits_sum: {attn_logits_sum}')
         eval_logger.debug(f'attn_logits_sum.shape : {attn_logits_sum.shape}')
         attn_logits_avg = attn_logits_sum.mean(dim=1) # 将每个 head 求平均 (batch_size, seqlen)
@@ -889,10 +889,15 @@ class Qwen2SdpaAttention(Qwen2Attention):
         
         # NOTE: custom code
         # print("TAG_3 Before func1 CPU usage:", monitor_cpu_usage())
-        if memory.reload_enable:
+        if memory.prefill_finished and not memory.has_reloaded and memory.reload_enable:
+            print(f'{layer_idx} 暂时保存原 q k v states')
             original_query_states = query_states
             original_key_states = key_states.cpu()
             original_value_states = value_states.cpu()
+
+            query_states_for_attn_score = query_states.clone()
+            key_states_for_attn_score = key_states.clone()
+
         # print("TAG_3 After func1 CPU usage:", monitor_cpu_usage())
 
         query_states, key_states = self.rotary_emb(query_states, key_states, position_ids)
@@ -913,7 +918,15 @@ class Qwen2SdpaAttention(Qwen2Attention):
             key_states = key_states.contiguous()
             value_states = value_states.contiguous()
 
-        if memory.prefill_finished and not memory.has_reloaded and memory.reload_enable and layer_idx in [0, 1, 2, 14, 15, 16, 25, 26, 27]:
+        #  and layer_idx in [0, 1, 2, 14, 15, 16, 25, 26, 27]
+        if memory.prefill_finished and not memory.has_reloaded and memory.reload_enable:
+
+            eval_logger.debug('进入prefill的最后一步，此时query是 instructin，需要进行检索')
+            this_layer_offload_activations = memory.offload_activations[layer_idx]
+            eval_logger.debug(f'载入这一层，之前存储的 raw kv')
+            eval_logger.debug(f'一共有：{len(this_layer_offload_activations)}')
+            for idx, tmp in enumerate(this_layer_offload_activations):
+                eval_logger.debug(f'chunk: {idx} shape: {tmp[0].shape}')
 
             record_for_print = {
                 'layer_idx':layer_idx,
@@ -924,12 +937,41 @@ class Qwen2SdpaAttention(Qwen2Attention):
                 'now_kv_seq_length':None,
             }
 
-            eval_logger.debug('进入prefill的最后一步，此时query是 instructin，需要进行检索')
-            this_layer_offload_activations = memory.offload_activations[layer_idx]
-            eval_logger.debug(f'载入这一层，之前存储的 raw kv')
-            eval_logger.debug(f'一共有：{len(this_layer_offload_activations)}')
-            for idx, tmp in enumerate(this_layer_offload_activations):
-                eval_logger.debug(f'chunk: {idx} shape: {tmp[0].shape}')
+            eval_logger.debug('打印chunk info:')
+            # 初始化一个列表用于存储每个chunk的position ids
+            position_ids_for_attn_score = []
+            for chunk_info in memory.chunk_infos:   # TODO check 一下是否包含了所有的，包括当前 input_ids
+                eval_logger.debug(chunk_info)
+
+                chunk_idx = chunk_info[0]
+                start_idx = chunk_info[1]
+                end_idx = chunk_info[2]
+
+                length = end_idx - start_idx
+
+                this_chunk_position_ids = torch.arange(length, dtype=torch.long, device=query_states.device).repeat(bsz, 1)
+
+                # 将当前chunk的position ids添加到列表中
+                position_ids_for_attn_score.append(this_chunk_position_ids)
+
+            position_ids_for_attn_score = torch.zeros(position_ids.shape[-1], dtype=torch.long).repeat(bsz, 1)
+            # 将所有chunk的position ids拼接成一个张量
+            # position_ids_for_attn_score = torch.cat(position_ids_for_attn_score, dim=1)  # dim=1表示按列拼接
+            eval_logger.info(f'position_ids_for_attn_score: {position_ids_for_attn_score}')
+            eval_logger.info(f'position_ids_for_attn_score[:50]: {position_ids_for_attn_score[:,:50]}')
+            print('不启用位置编码')
+            # new position ids for attn score calculation
+            # query_states_for_attn_score, key_states_for_attn_score = self.rotary_emb(query_states_for_attn_score, key_states_for_attn_score, position_ids_for_attn_score)
+
+            key_states_for_attn_score = repeat_kv(key_states_for_attn_score, self.num_key_value_groups)
+
+
+            # TODO: fix this, the last one is usually insturction, so this isn't should be included into chunk_infos
+            # TODO need to fix,  the first chunk is not always skip. need a more wisely stragedy
+            effective_chunk_infos = memory.chunk_infos[1:-1]
+            eval_logger.debug(f'effective_chunk_infos: {effective_chunk_infos}')
+            record_for_print['all_chunks'] = effective_chunk_infos
+
             
             # if layer_idx==27:
             #     pdb.set_trace()
@@ -938,22 +980,11 @@ class Qwen2SdpaAttention(Qwen2Attention):
             # print("key max:", key_states.max(), "key_states min:", key_states.min())
             # get attn score
             attn_weight, attn_logits = self.scaled_dot_product_attention_for_reload_step1(
-                query_states,
-                key_states,
+                query_states_for_attn_score,
+                key_states_for_attn_score,
             )
             # print("attn_weight max before softmax:", attn_weight.max())
             # print("attn_weight min before softmax:", attn_weight.min())
-
-            
-            eval_logger.debug('打印chunk info:')
-            for chunk_info in memory.chunk_infos[1:-1]: 
-                eval_logger.debug(chunk_info)
-
-            # TODO: fix this, the last one is usually insturction, so this isn't should be included into chunk_infos
-            # TODO need to fix,  the first chunk is not always skip. need a more wisely stragedy
-            effective_chunk_infos = memory.chunk_infos[1:-1]
-            eval_logger.debug(f'effective_chunk_infos: {effective_chunk_infos}')
-            record_for_print['all_chunks'] = effective_chunk_infos
 
             topk_values, topk_indices = self.scaled_dot_product_attention_for_reload_step2(attn_logits, effective_chunk_infos, top_k=memory.reload_top_k)
 
@@ -962,117 +993,123 @@ class Qwen2SdpaAttention(Qwen2Attention):
 
             record_for_print['topk_values'] = topk_values
             record_for_print['topk_indices'] = topk_indices
-
-            key_states_with_reload = original_key_states
-            val_states_with_reload = original_value_states
-
-            for indice in topk_indices:
-                eval_logger.debug('*'*100)
-                chunk_info = effective_chunk_infos[indice]
-                eval_logger.debug(f'当前选中的 chunk: {chunk_info}')
-                chunk_idx_selected = chunk_info[0]
-                start_idx = chunk_info[1]
-                end_idx = chunk_info[2]
-                # insert these retrieved chunk activation into current
-                this_chunk_raw_activation = this_layer_offload_activations[chunk_idx_selected]
-                # get it
-                reload_k_states = this_chunk_raw_activation[0]
-                reload_v_states = this_chunk_raw_activation[-1]
-                # update beacon activation
-                eval_logger.debug('='*100)
-                eval_logger.debug(f'执行reload_kv_into_beacon_activation：')
-                memory.reload_kv_into_beacon_activation(reload_k_states, reload_v_states, chunk_info, layer_idx)
-                eval_logger.debug('='*100)
-                
-                # TODO 这里采用了一个更省事的做法，直接拼接 kv 然后后面重新进算 attn，但实际上可以避免重复计算已经计算的 attn weight，这一部分不知道对效率影响大不大，先实现简单版本。
-                # concat
-                eval_logger.debug(f'original_key_states.shape: {original_key_states.shape}')
-                key_states_with_reload = torch.cat((key_states_with_reload[:,:,:start_idx,:], reload_k_states, key_states_with_reload[:,:,start_idx:,:]), dim=2)
-                val_states_with_reload = torch.cat((val_states_with_reload[:,:,:start_idx,:], reload_v_states, val_states_with_reload[:,:,start_idx:,:]), dim=2)
-
-                eval_logger.debug(f'key_states_with_reload.shape: {key_states_with_reload.shape}')
-
-            # generate new attention mask for sdpa, and new_kv_seq_len
-            eval_logger.debug(f'original attention_mask.shape: {attention_mask.shape}')
-            tgt_size = attention_mask.shape[-2]
-            src_size = key_states_with_reload.shape[-2]
-
-            record_for_print['original_kv_seq_length'] = attention_mask.shape[-1]
-            record_for_print['now_kv_seq_length'] = src_size
-
             self.print_info(record_for_print)
-
-            # mem_size meaning the size of reload memory exclude the current window
-            reload_mem_size = src_size - attention_mask.shape[-1]
-            reload_mem_attn = torch.ones(tgt_size, reload_mem_size, dtype=torch.bool, device=attention_mask.device)
-            
-            reload_mem_attn = reload_mem_attn[None, None, ...].expand(bsz, 1, tgt_size, reload_mem_size)
-
-            attention_mask = torch.cat([reload_mem_attn, attention_mask], dim=-1)
-
-            kv_seq_len = key_states_with_reload.shape[-2]
-            
-            eval_logger.debug(f'new attention_mask.shape: {attention_mask.shape}')
-            eval_logger.debug(f'new kv_seq_len.shape: {kv_seq_len}')
-
-            # allocate on GPU and attend calulate
-            # print("TAG_4 Before func1 CPU usage:", monitor_cpu_usage())
-            eval_logger.debug(f'dtype: {key_states_with_reload.dtype}')
-            eval_logger.debug(f'device: {key_states_with_reload.device}')
-            key_states_with_reload = key_states_with_reload.to(key_states.device)
-            val_states_with_reload = val_states_with_reload.to(key_states.device)
-            eval_logger.debug(f'dtype: {key_states_with_reload.dtype}')
-            eval_logger.debug(f'device: {key_states_with_reload.device}')
-            # print("TAG_4 Before func1 CPU usage:", monitor_cpu_usage())
-
-            # new position_ids TODO check its content
-            eval_logger.debug(f'original position_ids: {position_ids}')
-            position_ids = torch.arange(key_states_with_reload.shape[2], dtype=torch.long, device=key_states.device).repeat(key_states_with_reload.shape[0], 1)
-            eval_logger.debug(f'original position_ids: {position_ids}')
 
             # The last layer
             if layer_idx == self.config.num_hidden_layers-1:
                 memory.has_reloaded = True
 
-            query_states, key_states = self.rotary_emb(original_query_states, key_states_with_reload, position_ids)
-            value_states = val_states_with_reload
 
-            key_states = repeat_kv(key_states, self.num_key_value_groups)
-            value_states = repeat_kv(value_states, self.num_key_value_groups)
+        #     key_states_with_reload = original_key_states
+        #     val_states_with_reload = original_value_states
 
-            if attention_mask is not None:
-                if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                    raise ValueError(
-                        f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                    )
+        #     for indice in topk_indices:
+        #         eval_logger.debug('*'*100)
+        #         chunk_info = effective_chunk_infos[indice]
+        #         eval_logger.debug(f'当前选中的 chunk: {chunk_info}')
+        #         chunk_idx_selected = chunk_info[0]
+        #         start_idx = chunk_info[1]
+        #         end_idx = chunk_info[2]
+        #         # insert these retrieved chunk activation into current
+        #         this_chunk_raw_activation = this_layer_offload_activations[chunk_idx_selected]
+        #         # get it
+        #         reload_k_states = this_chunk_raw_activation[0]
+        #         reload_v_states = this_chunk_raw_activation[-1]
+        #         # update beacon activation
+        #         eval_logger.debug('='*100)
+        #         eval_logger.debug(f'执行reload_kv_into_beacon_activation：')
+        #         memory.reload_kv_into_beacon_activation(reload_k_states, reload_v_states, chunk_info, layer_idx)
+        #         eval_logger.debug('='*100)
+                
+        #         # TODO 这里采用了一个更省事的做法，直接拼接 kv 然后后面重新进算 attn，但实际上可以避免重复计算已经计算的 attn weight，这一部分不知道对效率影响大不大，先实现简单版本。
+        #         # concat
+        #         eval_logger.debug(f'original_key_states.shape: {original_key_states.shape}')
+        #         key_states_with_reload = torch.cat((key_states_with_reload[:,:,:start_idx,:], reload_k_states, key_states_with_reload[:,:,start_idx:,:]), dim=2)
+        #         val_states_with_reload = torch.cat((val_states_with_reload[:,:,:start_idx,:], reload_v_states, val_states_with_reload[:,:,start_idx:,:]), dim=2)
 
-            # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
-            # Reference: https://github.com/pytorch/pytorch/issues/112577.
-            if query_states.device.type == "cuda" and attention_mask is not None:
-                query_states = query_states.contiguous()
-                key_states = key_states.contiguous()
-                value_states = value_states.contiguous()
+        #         eval_logger.debug(f'key_states_with_reload.shape: {key_states_with_reload.shape}')
 
-            attn_output = torch.nn.functional.scaled_dot_product_attention(
-                query_states,
-                key_states,
-                value_states,
-                attn_mask=attention_mask,
-                dropout_p=self.attention_dropout if self.training else 0.0,
-                # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create a causal mask in case q_len == 1.
-                is_causal=self.is_causal and attention_mask is None and q_len > 1,
-            )
+        #     # generate new attention mask for sdpa, and new_kv_seq_len
+        #     eval_logger.debug(f'original attention_mask.shape: {attention_mask.shape}')
+        #     tgt_size = attention_mask.shape[-2]
+        #     src_size = key_states_with_reload.shape[-2]
 
-        else:
-            attn_output = torch.nn.functional.scaled_dot_product_attention(
-                query_states,
-                key_states,
-                value_states,
-                attn_mask=attention_mask,
-                dropout_p=self.attention_dropout if self.training else 0.0,
-                # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create a causal mask in case q_len == 1.
-                is_causal=self.is_causal and attention_mask is None and q_len > 1,
-            )
+        #     record_for_print['original_kv_seq_length'] = attention_mask.shape[-1]
+        #     record_for_print['now_kv_seq_length'] = src_size
+
+        #     self.print_info(record_for_print)
+
+        #     # mem_size meaning the size of reload memory exclude the current window
+        #     reload_mem_size = src_size - attention_mask.shape[-1]
+        #     reload_mem_attn = torch.ones(tgt_size, reload_mem_size, dtype=torch.bool, device=attention_mask.device)
+            
+        #     reload_mem_attn = reload_mem_attn[None, None, ...].expand(bsz, 1, tgt_size, reload_mem_size)
+
+        #     attention_mask = torch.cat([reload_mem_attn, attention_mask], dim=-1)
+
+        #     kv_seq_len = key_states_with_reload.shape[-2]
+            
+        #     eval_logger.debug(f'new attention_mask.shape: {attention_mask.shape}')
+        #     eval_logger.debug(f'new kv_seq_len.shape: {kv_seq_len}')
+
+        #     # allocate on GPU and attend calulate
+        #     # print("TAG_4 Before func1 CPU usage:", monitor_cpu_usage())
+        #     eval_logger.debug(f'dtype: {key_states_with_reload.dtype}')
+        #     eval_logger.debug(f'device: {key_states_with_reload.device}')
+        #     key_states_with_reload = key_states_with_reload.to(key_states.device)
+        #     val_states_with_reload = val_states_with_reload.to(key_states.device)
+        #     eval_logger.debug(f'dtype: {key_states_with_reload.dtype}')
+        #     eval_logger.debug(f'device: {key_states_with_reload.device}')
+        #     # print("TAG_4 Before func1 CPU usage:", monitor_cpu_usage())
+
+        #     # new position_ids TODO check its content
+        #     eval_logger.debug(f'original position_ids: {position_ids}')
+        #     position_ids = torch.arange(key_states_with_reload.shape[2], dtype=torch.long, device=key_states.device).repeat(key_states_with_reload.shape[0], 1)
+        #     eval_logger.debug(f'original position_ids: {position_ids}')
+
+        #     # The last layer
+        #     if layer_idx == self.config.num_hidden_layers-1:
+        #         memory.has_reloaded = True
+
+        #     query_states, key_states = self.rotary_emb(original_query_states, key_states_with_reload, position_ids)
+        #     value_states = val_states_with_reload
+
+        #     key_states = repeat_kv(key_states, self.num_key_value_groups)
+        #     value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        #     if attention_mask is not None:
+        #         if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+        #             raise ValueError(
+        #                 f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+        #             )
+
+        #     # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
+        #     # Reference: https://github.com/pytorch/pytorch/issues/112577.
+        #     if query_states.device.type == "cuda" and attention_mask is not None:
+        #         query_states = query_states.contiguous()
+        #         key_states = key_states.contiguous()
+        #         value_states = value_states.contiguous()
+
+        #     attn_output = torch.nn.functional.scaled_dot_product_attention(
+        #         query_states,
+        #         key_states,
+        #         value_states,
+        #         attn_mask=attention_mask,
+        #         dropout_p=self.attention_dropout if self.training else 0.0,
+        #         # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create a causal mask in case q_len == 1.
+        #         is_causal=self.is_causal and attention_mask is None and q_len > 1,
+        #     )
+
+        # else:
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=attention_mask,
+            dropout_p=self.attention_dropout if self.training else 0.0,
+            # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create a causal mask in case q_len == 1.
+            is_causal=self.is_causal and attention_mask is None and q_len > 1,
+        )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
@@ -2047,7 +2084,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
 
             # t3 = time.time()
             # 第一次 input_ids 是14，是 skip beacon的长度，past_key_values是28, 每个元素是这个形式 (None, None, 0, tensor([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], device='cuda:0')) 28是28层model layer的意思，其中四个元素的意思是 past_key, past_value, beacon_size, beacon_indices
-            # pdb.set_trace()
+
             input_ids, attention_mask_all_layers, position_ids_all_layers, past_key_values, labels = self.memory.step()
 
             # t4 = time.time()

@@ -25,7 +25,7 @@ def main():
 
     max_frames_num = 900 # you can change this to several thousands so long you GPU memory can handle it :)
     max_frames_num = 256
-    gen_kwargs = {"do_sample": True, "temperature": 1, "top_p": None, "num_beams": 1, "use_cache": True, "max_new_tokens": 1024}
+    gen_kwargs = {"do_sample": True, "temperature": 1, "top_p": None, "num_beams": 1, "use_cache": True, "max_new_tokens": 32}
 
     attn_implementation='sdpa'
     reload_enable=True

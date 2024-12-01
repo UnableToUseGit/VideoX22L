@@ -197,6 +197,9 @@ gen_kwargs = {"do_sample": False, "temperature": 0.0, "top_p": 1, "num_beams": 1
 tokenizer, model, image_processor, _ = load_pretrained_model(model_path, None, "llava_qwen", device_map="cuda:0", attn_implementation=args.attn_implementation, reload_enable=reload_enable,
 reload_top_k=args.reload_top_k)
 
+# model.config.beacon_ratio=[8]
+# print(f'压缩率：{model.config.beacon_ratio}')
+
 max_frames_num = 256
 correct = 0
 total = 0
@@ -217,10 +220,12 @@ for example in tqdm(dataset):
 
     #video input
     prompt1 = "<|im_start|>system\nCarefully watch this video and pay attention to every detail. Based on your observations, select the best option that accurately addresses the question.<|im_end|>\n<|im_start|>user\n<image>\n"
+    # prompt1 = "<|im_start|>\n<image>\n"
     prompt2 = inp
+    # prompt2 = ""
     prompt3 = "<|im_end|>\n<|im_start|>assistant\nBest Option: ("
     prompt = prompt1 + prompt2 + prompt3
-    
+    # pdb.set_trace()
     print("#####",prompt)
     input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(model.device)
     # vr = VideoReader(video_path, ctx=cpu(0))
@@ -245,6 +250,9 @@ for example in tqdm(dataset):
     beacon_skip_first = (input_ids == IMAGE_TOKEN_INDEX).nonzero(as_tuple=True)[1].item()
     num_tokens = TOKEN_PERFRAME * max_frames_num
     beacon_skip_last = beacon_skip_first  + num_tokens
+
+    print(f'beacon_skip_first: {beacon_skip_first}')
+    print(f'beacon_skip_last: {beacon_skip_last}')
 
     with torch.inference_mode():
         output_ids = model.generate(input_ids, images=[video_tensor],  modalities=["video"],beacon_skip_first=beacon_skip_first,beacon_skip_last=beacon_skip_last, **gen_kwargs)

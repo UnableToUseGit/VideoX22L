@@ -928,6 +928,7 @@ class Memory(torch.nn.Module):
         batch_size, src_size = attention_mask.size()
 
         # square for memory, and lower triangular for input_ids
+        # causal_mask = torch.full((tgt_size, tgt_size), True, dtype=dtype, device=device)
         causal_mask = torch.full((tgt_size, tgt_size), False, dtype=dtype, device=device)
         mask_cond = torch.arange(causal_mask.size(-1), device=device)
         causal_mask.masked_fill_(mask_cond < (mask_cond + 1).view(causal_mask.size(-1), -1), True)
