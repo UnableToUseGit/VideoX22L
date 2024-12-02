@@ -1,0 +1,5 @@
+*.pyc
+evluation/logs/
+/share/minghao/Projects/Video-XL/logs
+/share/minghao/Projects/Video-XL/evluation/scripts
+/share/minghao/Projects/Video-XL/evluation/results
