@@ -892,8 +892,8 @@ class Qwen2SdpaAttention(Qwen2Attention):
         if memory.prefill_finished and not memory.has_reloaded and memory.reload_enable:
             print(f'{layer_idx} 暂时保存原 q k v states')
             original_query_states = query_states
-            original_key_states = key_states.cpu()
-            original_value_states = value_states.cpu()
+            original_key_states = key_states.clone()
+            original_value_states = value_states.clone()
 
             query_states_for_attn_score = query_states.clone()
             key_states_for_attn_score = key_states.clone()
@@ -993,102 +993,106 @@ class Qwen2SdpaAttention(Qwen2Attention):
 
             record_for_print['topk_values'] = topk_values
             record_for_print['topk_indices'] = topk_indices
-            self.print_info(record_for_print)
+            # self.print_info(record_for_print)
 
             # The last layer
             if layer_idx == self.config.num_hidden_layers-1:
                 memory.has_reloaded = True
 
 
-        #     key_states_with_reload = original_key_states
-        #     val_states_with_reload = original_value_states
+            key_states_with_reload = original_key_states
+            val_states_with_reload = original_value_states
 
-        #     for indice in topk_indices:
-        #         eval_logger.debug('*'*100)
-        #         chunk_info = effective_chunk_infos[indice]
-        #         eval_logger.debug(f'当前选中的 chunk: {chunk_info}')
-        #         chunk_idx_selected = chunk_info[0]
-        #         start_idx = chunk_info[1]
-        #         end_idx = chunk_info[2]
-        #         # insert these retrieved chunk activation into current
-        #         this_chunk_raw_activation = this_layer_offload_activations[chunk_idx_selected]
-        #         # get it
-        #         reload_k_states = this_chunk_raw_activation[0]
-        #         reload_v_states = this_chunk_raw_activation[-1]
-        #         # update beacon activation
-        #         eval_logger.debug('='*100)
-        #         eval_logger.debug(f'执行reload_kv_into_beacon_activation：')
-        #         memory.reload_kv_into_beacon_activation(reload_k_states, reload_v_states, chunk_info, layer_idx)
-        #         eval_logger.debug('='*100)
+            for indice in topk_indices:
+                eval_logger.debug('*'*100)
+                chunk_info = effective_chunk_infos[indice]
+                eval_logger.debug(f'当前选中的 chunk: {chunk_info}')
+                chunk_idx_selected = chunk_info[0]
+                start_idx = chunk_info[1]
+                end_idx = chunk_info[2]
+                # insert these retrieved chunk activation into current
+                this_chunk_raw_activation = this_layer_offload_activations[chunk_idx_selected]
+                # get it
+                reload_k_states = this_chunk_raw_activation[0]
+                # reload_k_states = reload_k_states.to(key_states_with_reload.device)
+
+                reload_v_states = this_chunk_raw_activation[-1]
+                # reload_v_states = reload_v_states.to(val_states_with_reload.device)
+
+                # update beacon activation
+                eval_logger.debug('='*100)
+                eval_logger.debug(f'执行reload_kv_into_beacon_activation：')
+                memory.reload_kv_into_beacon_activation(reload_k_states, reload_v_states, chunk_info, layer_idx)
+                eval_logger.debug('='*100)
                 
-        #         # TODO 这里采用了一个更省事的做法，直接拼接 kv 然后后面重新进算 attn，但实际上可以避免重复计算已经计算的 attn weight，这一部分不知道对效率影响大不大，先实现简单版本。
-        #         # concat
-        #         eval_logger.debug(f'original_key_states.shape: {original_key_states.shape}')
-        #         key_states_with_reload = torch.cat((key_states_with_reload[:,:,:start_idx,:], reload_k_states, key_states_with_reload[:,:,start_idx:,:]), dim=2)
-        #         val_states_with_reload = torch.cat((val_states_with_reload[:,:,:start_idx,:], reload_v_states, val_states_with_reload[:,:,start_idx:,:]), dim=2)
+                # TODO 这里采用了一个更省事的做法，直接拼接 kv 然后后面重新进算 attn，但实际上可以避免重复计算已经计算的 attn weight，这一部分不知道对效率影响大不大，先实现简单版本。
+                # concat
+                eval_logger.debug(f'original_key_states.shape: {original_key_states.shape}')
+                key_states_with_reload = torch.cat((key_states_with_reload[:,:,:start_idx,:], reload_k_states, key_states_with_reload[:,:,start_idx:,:]), dim=2)
+                val_states_with_reload = torch.cat((val_states_with_reload[:,:,:start_idx,:], reload_v_states, val_states_with_reload[:,:,start_idx:,:]), dim=2)
 
-        #         eval_logger.debug(f'key_states_with_reload.shape: {key_states_with_reload.shape}')
+                eval_logger.debug(f'key_states_with_reload.shape: {key_states_with_reload.shape}')
 
-        #     # generate new attention mask for sdpa, and new_kv_seq_len
-        #     eval_logger.debug(f'original attention_mask.shape: {attention_mask.shape}')
-        #     tgt_size = attention_mask.shape[-2]
-        #     src_size = key_states_with_reload.shape[-2]
+            # generate new attention mask for sdpa, and new_kv_seq_len
+            eval_logger.debug(f'original attention_mask.shape: {attention_mask.shape}')
+            tgt_size = attention_mask.shape[-2]
+            src_size = key_states_with_reload.shape[-2]
 
-        #     record_for_print['original_kv_seq_length'] = attention_mask.shape[-1]
-        #     record_for_print['now_kv_seq_length'] = src_size
+            record_for_print['original_kv_seq_length'] = attention_mask.shape[-1]
+            record_for_print['now_kv_seq_length'] = src_size
 
-        #     self.print_info(record_for_print)
+            self.print_info(record_for_print)
 
-        #     # mem_size meaning the size of reload memory exclude the current window
-        #     reload_mem_size = src_size - attention_mask.shape[-1]
-        #     reload_mem_attn = torch.ones(tgt_size, reload_mem_size, dtype=torch.bool, device=attention_mask.device)
+            # # mem_size meaning the size of reload memory exclude the current window
+            # reload_mem_size = src_size - attention_mask.shape[-1]
+            # reload_mem_attn = torch.ones(tgt_size, reload_mem_size, dtype=torch.bool, device=attention_mask.device)
             
-        #     reload_mem_attn = reload_mem_attn[None, None, ...].expand(bsz, 1, tgt_size, reload_mem_size)
+            # reload_mem_attn = reload_mem_attn[None, None, ...].expand(bsz, 1, tgt_size, reload_mem_size)
 
-        #     attention_mask = torch.cat([reload_mem_attn, attention_mask], dim=-1)
+            # attention_mask = torch.cat([reload_mem_attn, attention_mask], dim=-1)
 
-        #     kv_seq_len = key_states_with_reload.shape[-2]
+            # kv_seq_len = key_states_with_reload.shape[-2]
             
-        #     eval_logger.debug(f'new attention_mask.shape: {attention_mask.shape}')
-        #     eval_logger.debug(f'new kv_seq_len.shape: {kv_seq_len}')
+            # eval_logger.debug(f'new attention_mask.shape: {attention_mask.shape}')
+            # eval_logger.debug(f'new kv_seq_len.shape: {kv_seq_len}')
 
-        #     # allocate on GPU and attend calulate
-        #     # print("TAG_4 Before func1 CPU usage:", monitor_cpu_usage())
-        #     eval_logger.debug(f'dtype: {key_states_with_reload.dtype}')
-        #     eval_logger.debug(f'device: {key_states_with_reload.device}')
-        #     key_states_with_reload = key_states_with_reload.to(key_states.device)
-        #     val_states_with_reload = val_states_with_reload.to(key_states.device)
-        #     eval_logger.debug(f'dtype: {key_states_with_reload.dtype}')
-        #     eval_logger.debug(f'device: {key_states_with_reload.device}')
-        #     # print("TAG_4 Before func1 CPU usage:", monitor_cpu_usage())
+            # # allocate on GPU and attend calulate
+            # # print("TAG_4 Before func1 CPU usage:", monitor_cpu_usage())
+            # eval_logger.debug(f'dtype: {key_states_with_reload.dtype}')
+            # eval_logger.debug(f'device: {key_states_with_reload.device}')
+            # key_states_with_reload = key_states_with_reload.to(key_states.device)
+            # val_states_with_reload = val_states_with_reload.to(key_states.device)
+            # eval_logger.debug(f'dtype: {key_states_with_reload.dtype}')
+            # eval_logger.debug(f'device: {key_states_with_reload.device}')
+            # # print("TAG_4 Before func1 CPU usage:", monitor_cpu_usage())
 
-        #     # new position_ids TODO check its content
-        #     eval_logger.debug(f'original position_ids: {position_ids}')
-        #     position_ids = torch.arange(key_states_with_reload.shape[2], dtype=torch.long, device=key_states.device).repeat(key_states_with_reload.shape[0], 1)
-        #     eval_logger.debug(f'original position_ids: {position_ids}')
+            # # new position_ids TODO check its content
+            # eval_logger.debug(f'original position_ids: {position_ids}')
+            # position_ids = torch.arange(key_states_with_reload.shape[2], dtype=torch.long, device=key_states.device).repeat(key_states_with_reload.shape[0], 1)
+            # eval_logger.debug(f'original position_ids: {position_ids}')
 
-        #     # The last layer
-        #     if layer_idx == self.config.num_hidden_layers-1:
-        #         memory.has_reloaded = True
+            # # The last layer
+            # if layer_idx == self.config.num_hidden_layers-1:
+            #     memory.has_reloaded = True
 
-        #     query_states, key_states = self.rotary_emb(original_query_states, key_states_with_reload, position_ids)
-        #     value_states = val_states_with_reload
+            # query_states, key_states = self.rotary_emb(original_query_states, key_states_with_reload, position_ids)
+            # value_states = val_states_with_reload
 
-        #     key_states = repeat_kv(key_states, self.num_key_value_groups)
-        #     value_states = repeat_kv(value_states, self.num_key_value_groups)
+            # key_states = repeat_kv(key_states, self.num_key_value_groups)
+            # value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        #     if attention_mask is not None:
-        #         if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-        #             raise ValueError(
-        #                 f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-        #             )
+            # if attention_mask is not None:
+            #     if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+            #         raise ValueError(
+            #             f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+            #         )
 
-        #     # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
-        #     # Reference: https://github.com/pytorch/pytorch/issues/112577.
-        #     if query_states.device.type == "cuda" and attention_mask is not None:
-        #         query_states = query_states.contiguous()
-        #         key_states = key_states.contiguous()
-        #         value_states = value_states.contiguous()
+            # # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
+            # # Reference: https://github.com/pytorch/pytorch/issues/112577.
+            # if query_states.device.type == "cuda" and attention_mask is not None:
+            #     query_states = query_states.contiguous()
+            #     key_states = key_states.contiguous()
+            #     value_states = value_states.contiguous()
 
         #     attn_output = torch.nn.functional.scaled_dot_product_attention(
         #         query_states,

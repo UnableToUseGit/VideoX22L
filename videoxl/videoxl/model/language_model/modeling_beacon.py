@@ -214,8 +214,8 @@ class Memory(torch.nn.Module):
     def reload_kv_into_beacon_activation(self, k_states_reloaded, v_states_reloaded, chunk_info, layer_idx):
         start_idx = chunk_info[1]
         # print("TAG_1 Before func1 CPU usage:", monitor_cpu_usage())
-        k_states_reloaded = k_states_reloaded.to(self._device)
-        v_states_reloaded = v_states_reloaded.to(self._device)
+        # k_states_reloaded = k_states_reloaded.to(self._device)
+        # v_states_reloaded = v_states_reloaded.to(self._device)
         # print("TAG_1 After func1 CPU usage:", monitor_cpu_usage())
 
         eval_logger.debug(f'k_states_reloaded shape: {k_states_reloaded.shape}')
@@ -815,9 +815,13 @@ class Memory(torch.nn.Module):
             # NOTE: custome code
             if self.reload_enable:
                 # print("TAG_2 Before func1 CPU usage:", monitor_cpu_usage())
+                # self.offload_activations[layer_idx].append([
+                #     key.cpu(.detach()),
+                #     value.detach().cpu(),
+                # ])
                 self.offload_activations[layer_idx].append([
-                    key.detach().cpu(),
-                    value.detach().cpu(),
+                    key.detach(),
+                    value.detach(),
                 ])
                 # print("TAG_2 Before func1 CPU usage:", monitor_cpu_usage())
 
