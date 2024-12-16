@@ -221,6 +221,7 @@ def evaluate_nll(model, dataloader, accelerator:Optional[Accelerator]=None):
 class BeaconModelOutput(BaseModelOutputWithPast):
     loss: Optional[torch.FloatTensor] = None
     batch_loss: Optional[torch.FloatTensor] = None
+    lmk_loss: Optional[torch.Tensor] = None
     valid_token_num: Optional[torch.LongTensor] = None
     logits: torch.FloatTensor = None
     past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None

@@ -19,16 +19,17 @@ import math
 import re
 import time
 import torch
+import torch.nn.functional as F
 import torch.nn as nn
 from .multimodal_encoder.builder import build_vision_tower
 from .multimodal_resampler.builder import build_vision_resampler
 from .multimodal_projector.builder import build_vision_projector
-
+from sklearn.metrics.pairwise import cosine_similarity
 from videoxl.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
-
 from videoxl.mm_utils import get_anyres_image_grid_shape
 import random
 from videoxl.utils import rank0_print
+import pdb
 
 class LlavaMetaModel:
 
@@ -182,29 +183,185 @@ class LlavaMetaForCausalLM(ABC):
         image_features = self.get_model().vision_resampler(image_features, images=images)
         return image_features
 
+    # def encode_multimodals(self, videos_or_images, video_idx_in_batch, split_sizes=None):
+    #     print("####video",videos_or_images.shape)
+    #     videos_or_images_features = self.get_model().get_vision_tower()(videos_or_images)
+    #     per_videos_or_images_features = torch.split(videos_or_images_features, split_sizes, dim=0)  # tuple, (dim_1, 576, 4096)
+    #     all_videos_or_images_features = []
+
+    #     for idx, feat in enumerate(per_videos_or_images_features):
+
+    #         feat = self.get_model().mm_projector(feat)
+    #         # Post pooling
+    #         if idx in video_idx_in_batch:
+    #             feat = self.get_2dPool(feat)
+    #         all_videos_or_images_features.append(feat)
+    #     return all_videos_or_images_features
+
+    
+
+    def compute_depth_scores(self, similarity_scores):
+        """
+        根据相邻帧的余弦相似度计算深度分数，使用纯PyTorch实现
+        """
+        n = similarity_scores.shape[0]
+
+        # 创建一个张量来存储 depth scores
+        depth_scores = torch.zeros(n, device=similarity_scores.device, dtype=similarity_scores.dtype)
+
+        for i in range(n):
+            # cli 是从 0 到 i 的最大相似度
+            cli = torch.max(similarity_scores[:i + 1]) if i > 0 else torch.tensor(0.0, device=similarity_scores.device)
+            
+            # cri 是从 i 到最后一帧的最大相似度
+            cri = torch.max(similarity_scores[i:]) if i < n - 1 else torch.tensor(0.0, device=similarity_scores.device)
+            
+            # 当前帧的相似度
+            ci = similarity_scores[i]
+            
+            # 计算深度分数
+            di = (cli + cri - 2 * ci) / 2
+            
+            # 存储结果
+            depth_scores[i] = di
+
+        return depth_scores
+
+
+    def compute_cosine_similarity(self,cls_features):
+        # 取 cls_features 的每一帧及其下一帧，形状为 (batch_size - 1, hidden_dim)
+        cls_current = cls_features[:-1]
+        cls_next = cls_features[1:]
+
+        # 使用 F.cosine_similarity 计算相邻帧之间的余弦相似度，dim=1 表示沿特征维度计算
+        similarity_scores = F.cosine_similarity(cls_current, cls_next, dim=1)
+
+        return similarity_scores
+    
+    def segment_video(self, depth_scores):
+        A=1
+        """
+        根据深度分数和设定的阈值对视频进行分割
+        使用 PyTorch tensor 实现
+        """
+        # 计算均值和标准差
+        mu = torch.mean(depth_scores)
+        sigma = torch.std(depth_scores)
+
+        # 分割阈值
+        threshold = mu + A * sigma
+
+        # 找出超过阈值的深度分数点（这些点用于划分视频）
+        split_points = torch.where(depth_scores > threshold)[0]
+
+        return split_points
+
+    def split_numbers(self,numbers):
+        result = []
+        for num in numbers:
+            while num > 100:
+                result.append(100)
+                num -= 100
+            result.append(num)
+        return result
+    
+    def adjust_splits(self, numbers, max_chunk_size=15):
+        # 该函数用于降过长的 chunk 继续拆分，防止 OOM
+        result = []
+        for num in numbers:
+            while num > max_chunk_size:
+                # 将 num 拆分为 max_chunk_size 的块
+                result.append(max_chunk_size)
+                num -= max_chunk_size
+                # 递归拆分，直到
+            result.append(num)
+        return result
+
     def encode_multimodals(self, videos_or_images, video_idx_in_batch, split_sizes=None):
-        videos_or_images_features = self.get_model().get_vision_tower()(videos_or_images)
+
+        # Define the maximum batch size (1024 frames)
+        max_batch_size = 1024
+        num_frames = videos_or_images.shape[0]
+
+        # Initialize a list to store the features from each batch
+        videos_or_images_features = []
+        cls_features=[]
+        # Split videos_or_images into smaller batches if num_frames > max_batch_size
+        if num_frames > max_batch_size:
+            # Calculate the number of batches needed
+            num_batches = (num_frames + max_batch_size - 1) // max_batch_size
+            
+            for i in range(num_batches):
+                start_idx = i * max_batch_size
+                end_idx = min((i + 1) * max_batch_size, num_frames)
+
+                # Process each batch separately
+                batch_videos_or_images = videos_or_images[start_idx:end_idx]
+                batch_features, batch_cls_features = self.get_model().get_vision_tower()(batch_videos_or_images)
+                videos_or_images_features.append(batch_features)
+                cls_features.append(batch_cls_features)
+
+            # Concatenate the features of all batches
+            videos_or_images_features = torch.cat(videos_or_images_features, dim=0)
+            cls_features = torch.cat(cls_features, dim=0)
+        else:
+            videos_or_images_features,cls_features = self.get_model().get_vision_tower()(videos_or_images)
+
+        # print("vide_idx",video_idx_in_batch)
+        if len(video_idx_in_batch)==0:
+            cls_features=cls_features[1:]
+        # print("#######",videos_or_images_features.shape,cls_features.shape)
+        similarity_scores = self.compute_cosine_similarity(cls_features)
+        # print("scores",similarity_scores)
+        depth_scores = self.compute_depth_scores(similarity_scores)
+        # print("depths",depth_scores)
+        split_points = self.segment_video(depth_scores)
+        # print("points",split_points)
+        max_chunk_size = 15
+    
+        frames_chunks = []
+
+        # TODO 用于测试，取消了 dynamic chunk 
+        split_points = []
+        if len(split_points)!=0:
+            diff_vals = split_points[1:] - split_points[:-1]
+            last_val = cls_features.shape[0] - split_points[-1].item()
+            result = [split_points[0].item()] +  diff_vals.tolist() + [last_val]
+            result = self.adjust_splits(result, max_chunk_size=max_chunk_size)
+            window_context=[144*r for r in result]
+            window_context = [x for x in window_context if x != 0]
+            
+            # r is the number of frames in one chunk
+            start_frame_idx = 0
+            for r in result:
+                end_frame_idx = start_frame_idx + r
+                frames_chunks.append((start_frame_idx,end_frame_idx))   # [) 左闭右开
+                start_frame_idx = end_frame_idx
+
+            assert sum(result)==cls_features.shape[0]
+        else:
+            # 整理默认 10 帧 一个 chunk
+            window_context = [1440]
+            frames_chunks = [(i, min(i + 10, num_frames)) for i in range(0, num_frames, 10)]
+
         per_videos_or_images_features = torch.split(videos_or_images_features, split_sizes, dim=0)  # tuple, (dim_1, 576, 4096)
         all_videos_or_images_features = []
-
+        
         for idx, feat in enumerate(per_videos_or_images_features):
-
             feat = self.get_model().mm_projector(feat)
             # Post pooling
             if idx in video_idx_in_batch:
                 feat = self.get_2dPool(feat)
             all_videos_or_images_features.append(feat)
-        return all_videos_or_images_features
+
+        return all_videos_or_images_features, window_context, frames_chunks
+
 
     def prepare_inputs_labels_for_multimodal(self, input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities=["image"], image_sizes=None):
         vision_tower = self.get_vision_tower()
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
 
-
-        if type(images) is not list and images.ndim == 4: # for image pretrain
-            images=list(images)
-      
         if type(images) is list or images.ndim == 5:
             if type(images) is list:
                 images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
@@ -455,6 +612,7 @@ class LlavaMetaForCausalLM(ABC):
     
 
     def get_image_features(self, input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities=["image"], image_sizes=None):
+        # print("%%%%%%%")
         vision_tower = self.get_vision_tower()
         if type(images) is list or images.ndim == 5:
             if type(images) is list:
@@ -478,7 +636,7 @@ class LlavaMetaForCausalLM(ABC):
             split_sizes = [image.shape[0] for image in images_list]
             # print("##########",concat_images.shape) # 16,3,336,336
 
-            image_features = self.encode_multimodals(concat_images, video_idx_in_batch, split_sizes)    #16,144,3584
+            image_features, window_context,frames_chunks= self.encode_multimodals(concat_images, video_idx_in_batch, split_sizes)    #16,144,3584
             # print("$$$$$$$$$$$",len(image_features),image_features[0].shape)
             
             mm_patch_merge_type = getattr(self.config, "mm_patch_merge_type", "flat")
@@ -615,5 +773,5 @@ class LlavaMetaForCausalLM(ABC):
             raise ValueError(error_message)
             #
 
-        return image_features
+        return image_features,window_context,frames_chunks
 

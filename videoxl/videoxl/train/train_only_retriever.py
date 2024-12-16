@@ -58,7 +58,11 @@ IS_TOKENIZER_GREATER_THAN_0_14 = version.parse(tokenizers.__version__) >= versio
 
 @dataclass
 class ModelArguments:
+    reload_enable: bool = field(default=False)
+    reload_top_k: Optional[int] = field(default=3)
+
     model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
+    trained_model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
     model_class_name: Optional[str] = field(default=None, metadata={"help": "Used to init model class, format is XXXXForCausalLM. e.g. currently XXXX is chosen from LlavaLlama, LlavaMixtral, LlavaMistral, Llama"})
 
     mm_tunable_parts: Optional[str] = field(
@@ -208,7 +212,8 @@ class TrainingArguments(transformers.TrainingArguments):
     auto_find_batch_size: bool = field(default=False)
     gradient_checkpointing: bool = field(default=True)
     verbose_logging: bool = field(default=False)
-    attn_implementation: str = field(default="flash_attention_2", metadata={"help": "Use transformers attention implementation."})
+    # attn_implementation: str = field(default="flash_attention_2", metadata={"help": "Use transformers attention implementation."})
+    attn_implementation: str = field(default="sdpa", metadata={"help": "Use transformers attention implementation."})
 
     group_by_stride: str = "none"
     sort_by_stride: Optional[str] = None
@@ -949,6 +954,7 @@ def preprocess(sources: Sequence[str], tokenizer: transformers.PreTrainedTokeniz
     3. Tokenize the concatenated conversation;
     4. Make a deepcopy as the target. Mask human words with IGNORE_INDEX.
     """
+
     if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.PLAIN:
         return preprocess_plain(sources, tokenizer)
     if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.LLAMA_2:
@@ -988,7 +994,7 @@ def preprocess(sources: Sequence[str], tokenizer: transformers.PreTrainedTokeniz
             tokenized_lens = _tokenize_fn([header] + [s["value"] for s in source], tokenizer)["input_ids_lens"]
         speakers = [sentence["from"] for sentence in source]
         _mask_targets(target, tokenized_lens, speakers)
-
+    
     return dict(input_ids=input_ids, labels=targets)
 
 
@@ -1171,7 +1177,7 @@ class LazySupervisedDataset(Dataset):
         if isinstance(i, int):
             sources = [sources]
         assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
-        print(f'sources:{sources}')
+        
         if "image" in sources[0]:
             image_file = self.list_data_dict[i]["image"]
             if type(image_file) is list:
@@ -1191,11 +1197,15 @@ class LazySupervisedDataset(Dataset):
                 print("File {} not exist!".format(video_file))
 
             try:
+                # print(f'\n========加载当前数据=======')
+                # print(f'sources:{sources}')
                 if 'gt_time_span' in self.list_data_dict[i]:
                     gt_time_span = self.list_data_dict[i]["gt_time_span"] # [[]..]
                 else:
                     gt_time_span = None
+                # TODO
                 video, gt_frame_idx = process_video_with_pyav(video_file, self.data_args, gt_time_span=gt_time_span)
+
 
                 # using videoreader
                 # if "shareVideoGPTV" not in video_file and "liangke" not in video_file:
@@ -1325,8 +1335,12 @@ class DataCollatorForSupervisedDataset(object):
             if "gt_frame_idx" in inst:
                 batch["gt_frame_idx"].append(inst["gt_frame_idx"])
             else:
-                batch["gt_frame_idx"].append(None)        
+                batch["gt_frame_idx"].append(None)   
 
+        batch["video_id"] = [instance["id"] for instance in instances]    
+
+        # print(f'\n========collator 当前数据=======')  
+        # print(f'batch["gt_frame_idx"]: {batch["gt_frame_idx"]}')   
         return batch
 
 
@@ -1405,7 +1419,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
             setattr(cfg_pretrained, k, v)
 
         customized_kwargs["config"] = cfg_pretrained
-    pdb.set_trace()
+
     if model_args.model_class_name is not None:
         actual_model_class_name = f"{model_args.model_class_name}ForCausalLM"
         model_class = getattr(transformers, actual_model_class_name)
@@ -1482,14 +1496,16 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                 else:   # NOTE: load model from there
                     # TODO load videoxl has trained; check its kwargs
                     model = LlavaQwenForCausalLM.from_pretrained(
-                        model_args.model_name_or_path,
+                        model_args.trained_model_name_or_path,
                         cache_dir=training_args.cache_dir,
                         attn_implementation=training_args.attn_implementation,
                         torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
                         low_cpu_mem_usage=False,
-                        **customized_kwargs,
+                        reload_enable=model_args.reload_enable,
+                        reload_top_k=model_args.reload_top_k
+                        # **customized_kwargs,
                     )
-                    pdb.set_trace()
+
         elif "gemma" in model_args.model_name_or_path.lower():
             model = LlavaGemmaForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
@@ -1557,6 +1573,8 @@ def train(attn_implementation=None):
         )
 
     model = get_model(model_args, training_args, bnb_model_from_pretrained_args)
+    print(f'\n========模型载入成功=======')
+    print(model)
     model.config.use_cache = False
     if model_args.rope_scaling_factor is not None and model_args.rope_scaling_type is not None:
         model.config.rope_scaling = {
@@ -1595,7 +1613,10 @@ def train(attn_implementation=None):
             bias=training_args.lora_bias,
             task_type="CAUSAL_LM",
         )
-        pdb.set_trace()
+
+        print(f'\n========只微调 retrieval layer=======')
+        print(lora_config)
+
         if training_args.bits == 16:
             if training_args.bf16:
                 model.to(torch.bfloat16)
@@ -1608,7 +1629,7 @@ def train(attn_implementation=None):
         tokenizer = transformers.AutoTokenizer.from_pretrained(model_args.model_name_or_path, cache_dir=training_args.cache_dir, model_max_length=training_args.model_max_length, padding_side="left")
     elif "qwen" in model_args.model_name_or_path.lower():
         tokenizer = transformers.AutoTokenizer.from_pretrained(model_args.model_name_or_path, cache_dir=training_args.cache_dir, model_max_length=training_args.model_max_length, padding_side="right")
-        pdb.set_trace()
+
     elif (
         "wizardlm-2" in model_args.model_name_or_path.lower()
         or "vicuna" in model_args.model_name_or_path.lower()
@@ -1642,7 +1663,7 @@ def train(attn_implementation=None):
             conversation_lib.default_conversation = conversation_lib.conv_templates[model_args.version]
         else:
             conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1"]
-    pdb.set_trace()
+
     if model_args.vision_tower is not None: # NOTE: here load mm_projector, vision resampler, 
         # model.get_model().initialize_vision_modules(model_args=model_args, fsdp=training_args.fsdp)
 
@@ -1679,59 +1700,60 @@ def train(attn_implementation=None):
         model.config.tokenizer_model_max_length = tokenizer.model_max_length
 
         ### NOTE: Deciding train which part of the model
-        pdb.set_trace() # TODO 改为全部冻结
-        if model_args.mm_tunable_parts is None:  # traditional way of deciding which part to train
-            model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
-            model.config.tune_mm_vision_resampler = training_args.tune_mm_vision_resampler = model_args.tune_mm_vision_resampler
-            if model_args.tune_mm_mlp_adapter or model_args.tune_mm_vision_resampler:
-                model.requires_grad_(False)
-            if model_args.tune_mm_mlp_adapter:
-                for p in model.get_model().mm_projector.parameters():
-                    p.requires_grad = True
-            if model_args.tune_mm_vision_resampler:
-                for p in model.get_model().vision_resampler.parameters():
-                    p.requires_grad = True
+        # pdb.set_trace() # TODO 改为全部冻结,好像本来就冻结了
 
-            model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
-            if training_args.freeze_mm_mlp_adapter:
-                for p in model.get_model().mm_projector.parameters():
-                    p.requires_grad = False
+        # if model_args.mm_tunable_parts is None:  # traditional way of deciding which part to train
+        #     model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
+        #     model.config.tune_mm_vision_resampler = training_args.tune_mm_vision_resampler = model_args.tune_mm_vision_resampler
+        #     if model_args.tune_mm_mlp_adapter or model_args.tune_mm_vision_resampler:
+        #         model.requires_grad_(False)
+        #     if model_args.tune_mm_mlp_adapter:
+        #         for p in model.get_model().mm_projector.parameters():
+        #             p.requires_grad = True
+        #     if model_args.tune_mm_vision_resampler:
+        #         for p in model.get_model().vision_resampler.parameters():
+        #             p.requires_grad = True
 
-            model.config.freeze_mm_vision_resampler = training_args.freeze_mm_vision_resampler
-            if training_args.freeze_mm_vision_resampler:
-                for p in model.get_model().vision_resampler.parameters():
-                    p.requires_grad = False
+        #     model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
+        #     if training_args.freeze_mm_mlp_adapter:
+        #         for p in model.get_model().mm_projector.parameters():
+        #             p.requires_grad = False
 
-            model.config.unfreeze_mm_vision_tower = model_args.unfreeze_mm_vision_tower
-            if model_args.unfreeze_mm_vision_tower:
-                vision_tower.requires_grad_(True)
-            else:
-                vision_tower.requires_grad_(False)
+        #     model.config.freeze_mm_vision_resampler = training_args.freeze_mm_vision_resampler
+        #     if training_args.freeze_mm_vision_resampler:
+        #         for p in model.get_model().vision_resampler.parameters():
+        #             p.requires_grad = False
 
-        else:
-            rank0_print(f"Using mm_tunable_parts: {model_args.mm_tunable_parts}")
-            model.config.mm_tunable_parts = training_args.mm_tunable_parts = model_args.mm_tunable_parts
-            # Set the entire model to not require gradients by default
-            model.requires_grad_(False)
-            vision_tower.requires_grad_(False)
-            model.get_model().mm_projector.requires_grad_(False)
-            model.get_model().vision_resampler.requires_grad_(False)
-            # Parse the mm_tunable_parts to decide which parts to unfreeze
-            tunable_parts = model_args.mm_tunable_parts.split(",")
-            if "mm_mlp_adapter" in tunable_parts:
-                for p in model.get_model().mm_projector.parameters():
-                    p.requires_grad = True
-            if "mm_vision_resampler" in tunable_parts:
-                for p in model.get_model().vision_resampler.parameters():
-                    p.requires_grad = True
-            if "mm_vision_tower" in tunable_parts:
-                for name, param in model.named_parameters():
-                    if "vision_tower" in name:
-                        param.requires_grad_(True)
-            if "mm_language_model" in tunable_parts:
-                for name, param in model.named_parameters():
-                    if "vision_tower" not in name and "mm_projector" not in name and "vision_resampler" not in name:
-                        param.requires_grad_(True)
+        #     model.config.unfreeze_mm_vision_tower = model_args.unfreeze_mm_vision_tower
+        #     if model_args.unfreeze_mm_vision_tower:
+        #         vision_tower.requires_grad_(True)
+        #     else:
+        #         vision_tower.requires_grad_(False)
+
+        # else:
+        #     rank0_print(f"Using mm_tunable_parts: {model_args.mm_tunable_parts}")
+        #     model.config.mm_tunable_parts = training_args.mm_tunable_parts = model_args.mm_tunable_parts
+        #     # Set the entire model to not require gradients by default
+        #     model.requires_grad_(False)
+        #     vision_tower.requires_grad_(False)
+        #     model.get_model().mm_projector.requires_grad_(False)
+        #     model.get_model().vision_resampler.requires_grad_(False)
+        #     # Parse the mm_tunable_parts to decide which parts to unfreeze
+        #     tunable_parts = model_args.mm_tunable_parts.split(",")
+        #     if "mm_mlp_adapter" in tunable_parts:
+        #         for p in model.get_model().mm_projector.parameters():
+        #             p.requires_grad = True
+        #     if "mm_vision_resampler" in tunable_parts:
+        #         for p in model.get_model().vision_resampler.parameters():
+        #             p.requires_grad = True
+        #     if "mm_vision_tower" in tunable_parts:
+        #         for name, param in model.named_parameters():
+        #             if "vision_tower" in name:
+        #                 param.requires_grad_(True)
+        #     if "mm_language_model" in tunable_parts:
+        #         for name, param in model.named_parameters():
+        #             if "vision_tower" not in name and "mm_projector" not in name and "vision_resampler" not in name:
+        #                 param.requires_grad_(True)
 
         total_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters())
         trainable_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters() if p.requires_grad)

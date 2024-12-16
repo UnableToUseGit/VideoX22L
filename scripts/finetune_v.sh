@@ -1,13 +1,20 @@
+cd /share/minghao/Projects/Video-XL/
+# source activate /share/minghao/Envs/videoxl
+# source activate /mnt/workspace/LXRlxr0_0/env/xl
+source activate /share/minghao/Envs/videoxl_train
 
+export CUDA_VISIBLE_DEVICES=0
 deepspeed videoxl/videoxl/train/train_mem.py \
+    --lora_enable True --lora_r 128 --lora_alpha 256 --mm_projector_lr 2e-5 \
     --deepspeed scripts/zero2_offload.json \
-    --model_name_or_path Qwen2-7B-Instruct \
+    --model_name_or_path /share/shuyan/Qwen2-7B-Instruct \
+    --trained_model_name_or_path /share/shuyan/VideoXL_weight_8 \
     --version qwen_1_5  \
-    --data_path video_traindata/anno/\{cinepine_order,bunny_695k_pure,baaicaption,cinepine_10k,gpt4o_image,gpt4o_video,nextqa,sharegpt4v\}.json \
-    --image_folder video_traindata/Bunny-v1_0-data/finetune/images \
-    --vision_tower clip-vit-large-patch14-336 \
-    --video_folder video_traindata \
-    --pretrain_mm_mlp_adapter checkpoints/pretrain/mm_projector.bin \
+    --data_path /share/shuyan/video_traindata/anno/\{my_test_video\}.json \
+    --image_folder /share/shuyan/video_traindata/Bunny-v1_0-data/finetune/images \
+    --vision_tower /share/shuyan/clip-vit-large-patch14-336 \
+    --video_folder /share/shuyan/video_traindata \
+    --pretrain_mm_mlp_adapter /share/shuyan/new1_copy/checkpoints/pretrain/mm_projector.bin \
     --mm_projector_type mlp2x_gelu \
     --image_aspect_ratio anyres \
     --group_by_modality_length True \
@@ -22,8 +29,8 @@ deepspeed videoxl/videoxl/train/train_mem.py \
     --mm_use_im_start_end False \
     --mm_use_im_patch_token False \
     --bf16 True \
-    --output_dir checkpoints/videoxl_fintune_v \
-    --num_train_epochs 3 \
+    --output_dir checkpoints/longva_llama_retrain_all_22 \
+    --num_train_epochs 1 \
     --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 4 \
     --gradient_accumulation_steps 8 \
@@ -39,7 +46,7 @@ deepspeed videoxl/videoxl/train/train_mem.py \
     --tf32 True \
     --model_max_length 32768 \
     --gradient_checkpointing True \
-    --dataloader_num_workers 4 \
+    --dataloader_num_workers 0 \
     --lazy_preprocess True \
     --run_name fienetune_v \
     --group_by_stride strict \
@@ -49,9 +56,9 @@ deepspeed videoxl/videoxl/train/train_mem.py \
     --beacon_attn full-coverage \
     --beacon_attend_prev True \
     --beacon_sink_size 0 \
-    --beacon_ratio 2 4 8 \
+    --beacon_ratio 2 4 8 12 16 \
     --beacon_ratio_mix step-random \
     --beacon_param q k v \
     --beacon_pos interleave \
-    --frames_upbound 128
+    --frames_upbound 64
 

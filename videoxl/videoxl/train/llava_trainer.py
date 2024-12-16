@@ -18,6 +18,7 @@ from transformers.trainer import (
 from transformers.trainer import Trainer, is_datasets_available
 from typing import List, Optional
 from .modeling_utils import evaluate_generation, evaluate_perplexity
+import pdb
 
 def get_vision_tower_state_maybe_zero_3(named_params, keys_to_match=['']):
     to_return = {k: t for k, t in named_params if any(
@@ -264,14 +265,14 @@ class LLaVATrainer(Trainer):
         """
         Prepare `inputs` before feeding them to the model, converting them to tensors if they are not already and
         handling potential state.
-        """
+        """ # inputs: input_ids, labels, attention mask, image size, image tensor。 来自于 collaborator
         inputs.pop("length", None)
         inputs.pop("index", None)
         # move to GPU
         inputs = self._prepare_input(inputs)
         # NOTE: reset memory for each individual input
         if hasattr(self.model, "memory"):
-            self.model.memory.reset()
+            self.model.memory.reset()   # NOTE 这个很重要，产生了关联
         return inputs
     
 

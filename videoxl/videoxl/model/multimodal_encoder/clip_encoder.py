@@ -19,14 +19,14 @@ class CLIPVisionTower(nn.Module):
         self.select_feature = getattr(args, "mm_vision_select_feature", "patch")
 
         if not delay_load:
-            # rank0_print(f"Loading vision tower: {vision_tower}")
+            # # rank0_print(f"Loading vision tower: {vision_tower}")
             self.load_model()
         elif getattr(args, "unfreeze_mm_vision_tower", False):
             # TODO: better detector is needed.
-            # rank0_print(f"The checkpoint seems to contain `vision_tower` weights: `unfreeze_mm_vision_tower`: True.")
+            # # rank0_print(f"The checkpoint seems to contain `vision_tower` weights: `unfreeze_mm_vision_tower`: True.")
             self.load_model()
         elif hasattr(args, "mm_tunable_parts") and "mm_vision_tower" in args.mm_tunable_parts:
-            rank0_print(f"The checkpoint seems to contain `vision_tower` weights: `mm_tunable_parts` contains `mm_vision_tower`.")
+            # rank0_print(f"The checkpoint seems to contain `vision_tower` weights: `mm_tunable_parts` contains `mm_vision_tower`.")
             self.load_model()
         else:
             self.cfg_only = CLIPVisionConfig.from_pretrained(self.vision_tower_name)
@@ -56,26 +56,39 @@ class CLIPVisionTower(nn.Module):
         else:
             image_features = image_forward_outs.hidden_states[self.select_layer]
 
+        # 提取CLS特征
+        cls_feature = image_features[:, 0, :]  # 取第0个标记，通常是CLS
+
         if select_feature_type == "patch":
-            image_features = image_features[:, 1:]
+            image_features = image_features[:, 1:]  # 去除CLS标记，保留patch特征
         elif select_feature_type == "cls_patch":
-            image_features = image_features
+            image_features = image_features  # 保留CLS和patch特征
         else:
             raise ValueError(f"Unexpected select feature: {select_feature_type}")
-        return image_features
+
+        return image_features, cls_feature  # 返回patch和CLS特征
+
 
     def forward(self, images):
         if type(images) is list:
             image_features = []
+            cls_features = []
             for image in images:
                 image_forward_out = self.vision_tower(image.to(device=self.device, dtype=self.dtype).unsqueeze(0), output_hidden_states=True)
-                image_feature = self.feature_select(image_forward_out).to(image.dtype)
+                image_feature, cls_feature = self.feature_select(image_forward_out)
+                image_feature = image_feature.to(image.dtype)
+                cls_feature = cls_feature.to(image.dtype)
                 image_features.append(image_feature)
+                cls_features.append(cls_feature)
         else:
             image_forward_outs = self.vision_tower(images.to(device=self.device, dtype=self.dtype), output_hidden_states=True)
-            image_features = self.feature_select(image_forward_outs).to(images.dtype)
+            image_features, cls_feature = self.feature_select(image_forward_outs)
+            image_features = image_features.to(images.dtype)
+            cls_feature = cls_feature.to(images.dtype)
 
-        return image_features
+
+        return image_features, cls_feature  # 同时返回patch特征和CLS特征
+
 
     @property
     def dummy_feature(self):
@@ -139,7 +152,7 @@ class CLIPVisionTowerS2(CLIPVisionTower):
 
     def load_model(self, device_map=None):
         if self.is_loaded:
-            rank0_print("{} is already loaded, `load_model` called again, skipping.".format(self.vision_tower_name))
+            # rank0_print("{} is already loaded, `load_model` called again, skipping.".format(self.vision_tower_name))
             return
 
         self.image_processor = CLIPImageProcessor.from_pretrained(self.vision_tower_name)

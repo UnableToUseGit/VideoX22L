@@ -43,14 +43,13 @@ def main():
 
     model_path = "/share/shuyan/VideoXL_weight_8"
     video_path = case['video']
-    # video_path="/share/junjie/code/videofactory/Evaluation_LVBench/LVBench_all/video_list/needle_40.mp4"
 
     max_frames_num = 256
     gen_kwargs = {"do_sample": False, "temperature": 1, "top_p": None, "num_beams": 1, "use_cache": True, "max_new_tokens": 32}
 
     attn_implementation='sdpa'
     reload_enable=True
-    reload_top_k=30
+    reload_top_k=3
 
     tokenizer, model, image_processor, _ = load_pretrained_model(model_path, None, "llava_qwen", device_map="cuda:0", attn_implementation=attn_implementation, reload_enable=reload_enable,
     reload_top_k=reload_top_k)
@@ -58,55 +57,54 @@ def main():
     # TODO change setting
     model.config.beacon_ratio=[8]   # you can delete this line to realize random compression of {2,4,8} ratio
 
-    while True:
-        question = f"Question: {case['question']}\n"
-        question += "Options:\n"
-        for idx, c in enumerate(case['candidates']):
-            question += f"({chr(ord('A') + idx)}) {c}\n"
-        question = question.rstrip()
+    question = f"Question: {case['question']}\n"
+    question += "Options:\n"
+    for idx, c in enumerate(case['candidates']):
+        question += f"({chr(ord('A') + idx)}) {c}\n"
+    question = question.rstrip()
 
-        inp = question + "\nOnly give the best option."
+    inp = question + "\nOnly give the best option."
 
-        #video input
-        prompt1 = "<|im_start|>system\nCarefully watch this video and pay attention to every detail. Based on your observations, select the best option that accurately addresses the question.<|im_end|>\n<|im_start|>user\n<image>\n"
-        prompt2 = inp
-        prompt3 = "<|im_end|>\n<|im_start|>assistant\nBest Option: ("
-        prompt = prompt1 + prompt2 + prompt3
+    #video input
+    prompt1 = "<|im_start|>system\nCarefully watch this video and pay attention to every detail. Based on your observations, select the best option that accurately addresses the question.<|im_end|>\n<|im_start|>user\n<image>\n"
+    prompt2 = inp
+    prompt3 = "<|im_end|>\n<|im_start|>assistant\nBest Option: ("
+    prompt = prompt1 + prompt2 + prompt3
 
-        # change setting
-        # query_suffix = '\n' + prompt2 + prompt3
-        query_suffix = "young girl in a tracksuit is doing yoga"
-        print(f'query_suffix: {query_suffix}')
+    # change setting
+    # query_suffix = '\n' + prompt2 + prompt3
+    query_suffix = "young girl in a tracksuit is doing yoga"
+    print(f'query_suffix: {query_suffix}')
 
-        model.memory.query_suffix = query_suffix
-        query_suffix_token_ids = tokenizer_image_token(query_suffix, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(model.device)  
-        model.memory.query_suffix_token_ids = query_suffix_token_ids
-        model.memory.query_suffix_token_ids_length = query_suffix_token_ids.shape[-1]
+    model.memory.query_suffix = query_suffix
+    query_suffix_token_ids = tokenizer_image_token(query_suffix, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(model.device)  
+    model.memory.query_suffix_token_ids = query_suffix_token_ids
+    model.memory.query_suffix_token_ids_length = query_suffix_token_ids.shape[-1]
 
-        input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(model.device)
+    input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(model.device)
 
-        vr = VideoReader(video_path, ctx=cpu(0))
-        total_frame_num = len(vr)
-        uniform_sampled_frames = np.linspace(0, total_frame_num - 1, max_frames_num, dtype=int)
-        frame_idx = uniform_sampled_frames.tolist()
-        frames = vr.get_batch(frame_idx).asnumpy()
-        video_tensor = image_processor.preprocess(frames, return_tensors="pt")["pixel_values"].to(model.device, dtype=torch.float16)
+    vr = VideoReader(video_path, ctx=cpu(0))
+    total_frame_num = len(vr)
+    uniform_sampled_frames = np.linspace(0, total_frame_num - 1, max_frames_num, dtype=int)
+    frame_idx = uniform_sampled_frames.tolist()
+    frames = vr.get_batch(frame_idx).asnumpy()
+    video_tensor = image_processor.preprocess(frames, return_tensors="pt")["pixel_values"].to(model.device, dtype=torch.float16)
 
-        beacon_skip_first = (input_ids == IMAGE_TOKEN_INDEX).nonzero(as_tuple=True)[1].item()
-        num_tokens = TOKEN_PERFRAME *max_frames_num
-        beacon_skip_last = beacon_skip_first  + num_tokens
+    beacon_skip_first = (input_ids == IMAGE_TOKEN_INDEX).nonzero(as_tuple=True)[1].item()
+    num_tokens = TOKEN_PERFRAME *max_frames_num
+    beacon_skip_last = beacon_skip_first  + num_tokens
 
-        with torch.inference_mode():
-            output_ids = model.generate(input_ids, images=[video_tensor],  modalities=["video"],beacon_skip_first=beacon_skip_first,beacon_skip_last=beacon_skip_last, **gen_kwargs)
+    with torch.inference_mode():
+        output_ids = model.generate(input_ids, images=[video_tensor],  modalities=["video"],beacon_skip_first=beacon_skip_first, beacon_skip_last=beacon_skip_last, **gen_kwargs)
 
-        if IMAGE_TOKEN_INDEX in input_ids:
-            transform_input_ids = transform_input_id(input_ids,num_tokens,model.config.vocab_size-1)
+    if IMAGE_TOKEN_INDEX in input_ids:
+        transform_input_ids = transform_input_id(input_ids,num_tokens,model.config.vocab_size-1)
 
-        output_ids=output_ids[:,transform_input_ids.shape[1]:]
-        outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
-        print(outputs)
+    output_ids=output_ids[:,transform_input_ids.shape[1]:]
+    outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
+    print(outputs)
 
-        model.memory.reset()
+    model.memory.reset()
 
 if __name__ == '__main__':
     main()

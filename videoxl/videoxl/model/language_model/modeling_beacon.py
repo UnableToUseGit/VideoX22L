@@ -120,16 +120,19 @@ class Memory(torch.nn.Module):
         self.sink_activations = [(None, None) for _ in range(self.config.num_hidden_layers)]
         # the beacon activations
         self.beacon_activations = [(None, None) for _ in range(self.config.num_hidden_layers)]
+        
+        # NOTE: dynamic chunk
+        self.count=0
 
         # NOTE:Custom code
         # the offload activations
         self.offload_activations = [[] for _ in range(self.config.num_hidden_layers)]
-        # the cached activations which selected to reload from the offload activations
-        # [[[k_states, v_states, chunkinfo], ...]...]
-        self.cached_activations = [[] for _ in range(self.config.num_hidden_layers)]
+        self.retrieval_activations = [None for _ in range(self.config.num_hidden_layers)]
+
         self.chunk_infos = []
         self.has_reloaded = False
-        # self.prefill_finished = False
+
+        self.query_sep_pos_id_left = -1
 
     @property
     def all_sequence_length(self):
@@ -212,32 +215,19 @@ class Memory(torch.nn.Module):
 
     # NOTE: reload from offload
     def reload_kv_into_beacon_activation(self, k_states_reloaded, v_states_reloaded, chunk_info, layer_idx):
+        
         start_idx = chunk_info[1]
-        # print("TAG_1 Before func1 CPU usage:", monitor_cpu_usage())
-        # k_states_reloaded = k_states_reloaded.to(self._device)
-        # v_states_reloaded = v_states_reloaded.to(self._device)
-        # print("TAG_1 After func1 CPU usage:", monitor_cpu_usage())
-
-        eval_logger.debug(f'k_states_reloaded shape: {k_states_reloaded.shape}')
-
         sink_key, sink_value = self.sink_activations[layer_idx]
         beacon_key, beacon_value = self.beacon_activations[layer_idx]
         k_activation = cat_tensor([sink_key, beacon_key], dim=self.k_seq_dim)
         v_activation = cat_tensor([sink_value, beacon_value], dim=self.v_seq_dim)
-
-        eval_logger.debug(f'k_activation[:,:,:start_idx,:] shape: {k_activation[:,:,:start_idx,:].shape}')
-        eval_logger.debug(f'k_activation[:,:,start_idx:,:] shape: {k_activation[:,:,start_idx:,:].shape}')
-
         k_activation_cat_reload = torch.cat((k_activation[:,:,:start_idx,:], k_states_reloaded, k_activation[:,:,start_idx:,:]), dim=2)
         v_activation_cat_reload = torch.cat((v_activation[:,:,:start_idx,:], v_states_reloaded, v_activation[:,:,start_idx:,:]), dim=2)
-
-        eval_logger.debug(f'k_activation_cat_reload shape: {k_activation_cat_reload.shape}')
         
         beacon_key_cat_reload = k_activation_cat_reload[:,:,sink_key.shape[2]:,:]
         beacon_value_cat_reload = v_activation_cat_reload[:,:,sink_key.shape[2]:,:]
         # update
         self.beacon_activations[layer_idx] = (beacon_key_cat_reload, beacon_value_cat_reload)
-        eval_logger.debug(f'更新后, self.beacon_activations[layer_idx]: {self.beacon_activations[layer_idx][0].shape}')
 
     def prepare(self, input_ids, attention_mask, labels, skip_first=None, skip_last=None):
         """
@@ -245,6 +235,20 @@ class Memory(torch.nn.Module):
         """
         # assert input_ids.shape[0] == 1, "Make sure the batch size is 1!"
         # assert attention_mask is None or (attention_mask == 1).all(), "Make sure there is no padding!"
+
+        length = input_ids.shape[-1]
+        flag_token_id = 151645
+        count_triger = 2
+        count = 0
+        for i in range(length - 1, -1, -1):
+            if input_ids[0][i] == flag_token_id:
+                count = count + 1
+            if count == count_triger:
+                self.query_sep_pos_id_left = i - length
+                break
+
+        # TODO process input ids to get end pos idx of query
+
         self._device = input_ids.device
 
         # accumulate input_ids
@@ -808,22 +812,24 @@ class Memory(torch.nn.Module):
         """
         Accumulate beacon activations and raw activations.
         """
-        for layer_idx, (key, value, beacon_size, beacon_indices) in enumerate(past_key_values):
+        for layer_idx, (key, value, beacon_size, beacon_indices, key_states_for_retrieval) in enumerate(past_key_values):
+
+            if key_states_for_retrieval is not None:
+                if self.retrieval_activations[layer_idx] is not None:
+                    self.retrieval_activations[layer_idx] = torch.cat([self.retrieval_activations[layer_idx], key_states_for_retrieval], dim=self.k_seq_dim)
+                else:
+                    self.retrieval_activations[layer_idx] = key_states_for_retrieval
+
             # NOTE: the past_key_values are incrementally returned (only the new keys and values are returned)
             previous_raw_key, previous_raw_value = self.raw_activations[layer_idx]
 
             # NOTE: custome code
             if self.reload_enable:
-                # print("TAG_2 Before func1 CPU usage:", monitor_cpu_usage())
-                # self.offload_activations[layer_idx].append([
-                #     key.cpu(.detach()),
-                #     value.detach().cpu(),
-                # ])
                 self.offload_activations[layer_idx].append([
                     key.detach(),
                     value.detach(),
                 ])
-                # print("TAG_2 Before func1 CPU usage:", monitor_cpu_usage())
+
 
             if self.beacon_skip_first is not None and self.sink_activations[layer_idx][0] is None:
                 assert key.shape[self.k_seq_dim] == self.beacon_skip_first
@@ -860,16 +866,18 @@ class Memory(torch.nn.Module):
             else:
                 # NOTE: use the correct previous_beacon_key and value!
                 previous_beacon_key, previous_beacon_value = self.beacon_activations[layer_idx]
-                
-                beacon_key, beacon_value, raw_key, raw_value = self._extract_beacon_and_raw_memory(
-                    key, 
-                    value, 
-                    previous_beacon_key, 
-                    previous_beacon_value, 
-                    previous_raw_key, 
-                    previous_raw_value, 
-                    beacon_indices,
-                )
+                try:
+                    beacon_key, beacon_value, raw_key, raw_value = self._extract_beacon_and_raw_memory(
+                        key, 
+                        value, 
+                        previous_beacon_key, 
+                        previous_beacon_value, 
+                        previous_raw_key, 
+                        previous_raw_value, 
+                        beacon_indices,
+                    )
+                except:
+                    pdb.set_trace()
 
                 self.beacon_activations[layer_idx] = (beacon_key, beacon_value)
                 self.raw_activations[layer_idx] = (raw_key, raw_value)
@@ -887,10 +895,13 @@ class Memory(torch.nn.Module):
             self.batch_loss = self.batch_loss + batch_loss * valid_token_num
             self.valid_token_num = self.valid_token_num + valid_token_num
 
-    def output(self, model_outputs):
+    def output(self, model_outputs, lmk_loss=None):
         """
         Override loss with accumulated loss. Update the next-token logits.
         """
+
+        # TODO lmk loss 应该怎么加
+
         # override loss
         if self.batch_loss is not None:
             # here the batch_loss is the summation of all token losses in each element
@@ -912,6 +923,13 @@ class Memory(torch.nn.Module):
             logits = model_outputs["logits"]
             beacon_indices = self.beacon_indices[-logits.shape[1]:]
             model_outputs["logits"] = logits[:, beacon_indices == 0]
+        
+        if lmk_loss is not None:
+            # if "loss" in model_outputs and model_outputs["loss"] is not None:
+            #     model_outputs["loss"] = model_outputs["loss"] + lmk_loss
+            # else:
+            model_outputs["loss"] = lmk_loss
+            model_outputs["batch_loss"] = lmk_loss
 
         return model_outputs
 
@@ -940,7 +958,7 @@ class Memory(torch.nn.Module):
         causal_mask = causal_mask[None, None, ...].expand(batch_size, 1, tgt_size, src_size)
         # 1 for non-padding tokens
         expand_mask = attention_mask[:, None, None, :].expand(batch_size, 1, tgt_size, src_size)
-        invert_mask = 1.0 - expand_mask
+        invert_mask = ~expand_mask
         ###add
         # invert_mask = ~ expand_mask
         # invert_mask.masked_fill_(invert_mask.bool(), min_value)
