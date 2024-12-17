@@ -603,6 +603,11 @@ class Qwen2Attention(nn.Module):
                 if self.beacon_k_proj.bias is not None:
                     self.k_proj_retrieval.bias.data[:] = self.beacon_k_proj.bias.data
 
+            # if any("k_proj_retrieval" in missing_key for missing_key in missing_keys):
+            #     self.k_proj_retrieval.weight.data[:] = self.k_proj.weight.data
+            #     if self.k_proj.bias is not None:
+            #         self.k_proj_retrieval.bias.data[:] = self.k_proj.bias.data
+
             # if any("v_proj_retrieval" in missing_key for missing_key in missing_keys):
             #     self.v_proj_retrieval.weight.data[:] = self.beacon_v_proj.weight.data
             #     if self.beacon_v_proj.bias is not None:
@@ -984,8 +989,9 @@ class Qwen2SdpaAttention(Qwen2Attention):
             scores = self.compute_similarity(q_reps, p_reps) / temperature
         
             scores_len = scores.size(-1)
-            target_layers = [3,7,11,15,19,23] # 在 bf 16 精度下，前两层和最后一层 score 区分不明显
-            
+            # target_layers = [3,7,11,15,19,23] # 在 bf 16 精度下，前两层和最后一层 score 区分不明显
+            target_layers = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27]
+
             ground_truth_pos = list(set(ground_truth_pos))
             if layer_idx in target_layers and ground_truth_pos is not None:
                 total_pos_num = len(ground_truth_pos)
