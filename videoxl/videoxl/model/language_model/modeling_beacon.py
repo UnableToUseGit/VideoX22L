@@ -814,14 +814,7 @@ class Memory(torch.nn.Module):
         """
         Accumulate beacon activations and raw activations.
         """
-        for layer_idx, (key, value, beacon_size, beacon_indices, key_states_for_retrieval) in enumerate(past_key_values):
-
-            if key_states_for_retrieval is not None:
-                if self.retrieval_activations[layer_idx] is not None:
-                    self.retrieval_activations[layer_idx] = torch.cat([self.retrieval_activations[layer_idx], key_states_for_retrieval], dim=self.k_seq_dim)
-                else:
-                    self.retrieval_activations[layer_idx] = key_states_for_retrieval
-
+        for layer_idx, (key, value, beacon_size, beacon_indices) in enumerate(past_key_values):
             # NOTE: the past_key_values are incrementally returned (only the new keys and values are returned)
             previous_raw_key, previous_raw_value = self.raw_activations[layer_idx]
 
@@ -831,7 +824,6 @@ class Memory(torch.nn.Module):
                     key.detach(),
                     value.detach(),
                 ])
-
 
             if self.beacon_skip_first is not None and self.sink_activations[layer_idx][0] is None:
                 assert key.shape[self.k_seq_dim] == self.beacon_skip_first

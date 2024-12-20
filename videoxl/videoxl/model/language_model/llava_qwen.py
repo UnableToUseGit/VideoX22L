@@ -427,14 +427,6 @@ class Qwen2Attention(nn.Module):
             self.beacon_o_proj.weight.data.zero_()
             self.beacon_o_proj._is_hf_initialized = True
 
-        #NOTE: custom; define q_proj_retrieval
-        self.q_proj_retrieval = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=True)
-        self.q_proj_retrieval._is_hf_initialized = True
-        self.k_proj_retrieval = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
-        self.k_proj_retrieval._is_hf_initialized = True
-        # self.v_proj_retrieval = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
-        # self.v_proj_retrieval._is_hf_initialized = True
-
     def _init_rope(self):
         if self.config.rope_scaling is None:
             self.rotary_emb = Qwen2RotaryEmbedding(
@@ -534,39 +526,7 @@ class Qwen2Attention(nn.Module):
                         if self.o_proj.bias is not None:
                             self.beacon_o_proj.bias.data[:] = self.o_proj.bias.data
 
-            # TODO 有点诡异，missing key? 只要开启训练就 这样初始化吗？ 不考虑是否有 之前的权重
-
-            # NOTE: custom; initilize q_proj_retrieval based on deepspeed
-            params = [self.q_proj_retrieval.weight, self.q_proj.weight]
-            if self.q_proj.bias is not None:
-                params.extend([self.q_proj_retrieval.bias, self.q_proj.bias])
-            with deepspeed.zero.GatheredParameters(params, modifier_rank=0):
-                # FIXME: after deepspeed initialization, some weights becomes non-zero, but there are rows that are full of zeros
-                if (self.q_proj_retrieval.weight.sum(-1) == 0).any() or (self.q_proj_retrieval.weight > 1e29).any():
-                    self.q_proj_retrieval.weight.data[:] = self.q_proj.weight.data
-                    if self.q_proj.bias is not None:
-                        self.q_proj_retrieval.bias.data[:] = self.q_proj.bias.data
             
-            params = [self.k_proj_retrieval.weight, self.beacon_k_proj.weight]
-            if self.beacon_k_proj.bias is not None:
-                params.extend([self.k_proj_retrieval.bias, self.beacon_k_proj.bias])
-            with deepspeed.zero.GatheredParameters(params, modifier_rank=0):
-                # FIXME: after deepspeed initialization, some weights becomes non-zero, but there are rows that are full of zeros
-                if (self.k_proj_retrieval.weight.sum(-1) == 0).any() or (self.k_proj_retrieval.weight > 1e29).any():
-                    self.k_proj_retrieval.weight.data[:] = self.beacon_k_proj.weight.data
-                    if self.beacon_k_proj.bias is not None:
-                        self.k_proj_retrieval.bias.data[:] = self.beacon_k_proj.bias.data
-
-            # params = [self.v_proj_retrieval.weight, self.beacon_v_proj.weight]
-            # if self.beacon_v_proj.bias is not None:
-            #     params.extend([self.v_proj_retrieval.bias, self.beacon_v_proj.bias])
-            # with deepspeed.zero.GatheredParameters(params, modifier_rank=0):
-            #     # FIXME: after deepspeed initialization, some weights becomes non-zero, but there are rows that are full of zeros
-            #     if (self.v_proj_retrieval.weight.sum(-1) == 0).any() or (self.v_proj_retrieval.weight > 1e29).any():
-            #         self.v_proj_retrieval.weight.data[:] = self.beacon_v_proj.weight.data
-            #         if self.beacon_v_proj.bias is not None:
-            #             self.v_proj_retrieval.bias.data[:] = self.beacon_v_proj.bias.data
-
         else:
 
             # only copy the value in-place, without tieing the weight
@@ -591,27 +551,6 @@ class Qwen2Attention(nn.Module):
                     self.beacon_o_proj.weight.data[:] = self.o_proj.weight.data
                     if self.o_proj.bias is not None:
                         self.beacon_o_proj.bias.data[:] = self.o_proj.bias.data
-
-            # NOTE: custom; initilize q_proj_retrieval
-            if any("q_proj_retrieval" in missing_key for missing_key in missing_keys):
-                self.q_proj_retrieval.weight.data[:] = self.q_proj.weight.data
-                if self.q_proj.bias is not None:
-                    self.q_proj_retrieval.bias.data[:] = self.q_proj.bias.data
-
-            if any("k_proj_retrieval" in missing_key for missing_key in missing_keys):
-                self.k_proj_retrieval.weight.data[:] = self.beacon_k_proj.weight.data
-                if self.beacon_k_proj.bias is not None:
-                    self.k_proj_retrieval.bias.data[:] = self.beacon_k_proj.bias.data
-
-            # if any("k_proj_retrieval" in missing_key for missing_key in missing_keys):
-            #     self.k_proj_retrieval.weight.data[:] = self.k_proj.weight.data
-            #     if self.k_proj.bias is not None:
-            #         self.k_proj_retrieval.bias.data[:] = self.k_proj.bias.data
-
-            # if any("v_proj_retrieval" in missing_key for missing_key in missing_keys):
-            #     self.v_proj_retrieval.weight.data[:] = self.beacon_v_proj.weight.data
-            #     if self.beacon_v_proj.bias is not None:
-            #         self.v_proj_retrieval.bias.data[:] = self.beacon_v_proj.bias.data
 
             
 
@@ -881,19 +820,7 @@ class Qwen2SdpaAttention(Qwen2Attention):
 
         # return keys and values before rope
         # NOTE: incrementally return keys and values for efficiency 
-        past_key_value = (key_states, value_states, beacon_size, beacon_indices, None)
-        
-        # NOTE: custom code: store the key_states_for_retrieval for every chunk
-        if memory.reload_enable and layer_idx != 0 and beacon_size != 0 and q_len != 1:
-
-            key_states_for_retrieval = self.k_proj_with_retrieval(hidden_states, beacon_size, beacon_indices)
-
-            if beacon_size != 0:
-                key_states_for_retrieval = key_states_for_retrieval.view(bsz, beacon_size, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-            else:
-                key_states_for_retrieval = key_states_for_retrieval.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-                
-            past_key_value = (key_states, value_states, beacon_size, beacon_indices, key_states_for_retrieval)
+        past_key_value = (key_states, value_states, beacon_size, beacon_indices)
 
         if past_key is not None:
             # reuse k, v, self_attention
@@ -902,12 +829,10 @@ class Qwen2SdpaAttention(Qwen2Attention):
 
         # NOTE: custom code: prepare for retrieval  
         if memory.reload_enable and layer_idx != 0 and beacon_size == 0 and past_key is not None and q_len != 1:
-            original_query_states = query_states
+            original_query_states = query_states.clone()
             original_key_states = key_states.clone()
             original_value_states = value_states.clone()
-            query_states_for_retrieval = self.q_proj_retrieval(hidden_states[:, :memory.query_sep_pos_id_left, :])
-            true_q_len = q_len + memory.query_sep_pos_id_left
-            query_states_for_retrieval = query_states_for_retrieval.view(bsz, true_q_len, self.num_heads, self.head_dim).transpose(1, 2)
+            query_states_for_retrieval = query_states.clone()[:, :, :memory.query_sep_pos_id_left, :]
                 
         query_states, key_states = self.rotary_emb(query_states, key_states, position_ids)
 
@@ -946,7 +871,7 @@ class Qwen2SdpaAttention(Qwen2Attention):
             # training or prefilling phase
             # shape: bsz, q_len, num_heads, head_dim
             query_reps = query_states_for_retrieval.permute(0, 2, 1, 3)
-            key_states_for_retrieval = memory.retrieval_activations[layer_idx]
+            key_states_for_retrieval = past_key[:, :, memory.beacon_skip_first:,:]
             key_states_for_retrieval = repeat_kv(key_states_for_retrieval, self.num_key_value_groups)
             key_reps = key_states_for_retrieval.permute(0, 2, 1, 3)
 
@@ -989,8 +914,8 @@ class Qwen2SdpaAttention(Qwen2Attention):
             scores = self.compute_similarity(q_reps, p_reps) / temperature
         
             scores_len = scores.size(-1)
-            # target_layers = [3,7,11,15,19,23] # 在 bf 16 精度下，前两层和最后一层 score 区分不明显
-            target_layers = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27]
+            target_layers = [3, 7, 11, 13, 15, 17, 19, 21, 23, 25, 27] # 在 bf 16 精度下，前两层和最后一层 score 区分不明显
+            # target_layers = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27]
 
             if layer_idx in target_layers and ground_truth_pos is not None:
                 ground_truth_pos = list(set(ground_truth_pos))
