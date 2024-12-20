@@ -232,19 +232,21 @@ class Memory(torch.nn.Module):
     def prepare(self, input_ids, attention_mask, labels, skip_first=None, skip_last=None):
         """
         Prepare inputs for the model. These inputs belong to the same sequence.
+         13, 151645,    198, 151644,  77091,    198,   9693, 151645,
+            198]], device='cuda:0')
         """
         # assert input_ids.shape[0] == 1, "Make sure the batch size is 1!"
         # assert attention_mask is None or (attention_mask == 1).all(), "Make sure there is no padding!"
 
         length = input_ids.shape[-1]
-        flag_token_id = 151645
-        count_triger = 2
+        flag_token_id = 151644 # 151644: "<|im_start|>"  151645: "<|im_end|>"
+        count_triger = 1
         count = 0
         for i in range(length - 1, -1, -1):
             if input_ids[0][i] == flag_token_id:
                 count = count + 1
             if count == count_triger:
-                self.query_sep_pos_id_left = i - length
+                self.query_sep_pos_id_left = i - length - 2 
                 break
 
         # TODO process input ids to get end pos idx of query
@@ -259,7 +261,7 @@ class Memory(torch.nn.Module):
 
         # accumulate attention_mask
         if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids, device=torch.device("cpu"))
+            attention_mask = torch.ones_like(input_ids, device=torch.device("cpu"), dtype=torch.bool)
         if self.all_attention_mask is None:
             self.all_attention_mask = attention_mask.cpu()
         else:

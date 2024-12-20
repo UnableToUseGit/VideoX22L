@@ -45,7 +45,7 @@ from videoxl.train.pretrain_llava_trainer import Pre_LLaVATrainer
 from videoxl import conversation as conversation_lib
 from videoxl.model import *
 from videoxl.mm_utils import process_highres_image, process_anyres_image, process_highres_image_crop_split, tokenizer_image_token
-from videoxl.utils import rank0_print, process_video_with_pyav
+from videoxl.utils import rank0_print, process_video_with_pyav, process_video_after_preproecess
 import pdb
 
 torch.multiprocessing.set_sharing_strategy("file_system")
@@ -1006,18 +1006,36 @@ class LazySupervisedDataset(Dataset):
 
         # Handle multiple JSON files specified in the data_path
         if "{" in data_path and "}" in data_path:
-            base_path, file_pattern = re.match(r"^(.*)\{(.*)\}\.json$", data_path).groups()
-            file_names = file_pattern.split(",")
-            rank0_print(f"Loading {file_names} from {base_path}")
-            data_args.dataset_paths = []
-            for file_name in file_names:
-                data_args.dataset_paths.append(f"{base_path}{file_name}.json")
-                full_path = f"{base_path}{file_name}.json"
-                rank0_print(f"Loading {full_path}")
-                with open(full_path, "r") as file:
-                    cur_data_dict = json.load(file)
-                    rank0_print(f"Loaded {len(cur_data_dict)} samples from {full_path}")
-                    self.list_data_dict.extend(cur_data_dict)
+            if 'jsonl' in data_path:
+                base_path, file_pattern = re.match(r"^(.*)\{(.*)\}\.jsonl$", data_path).groups()
+                file_names = file_pattern.split(",")
+                rank0_print(f"Loading {file_names} from {base_path}")
+                data_args.dataset_paths = []
+                for file_name in file_names:
+                    data_args.dataset_paths.append(f"{base_path}{file_name}.jsonl")
+                    full_path = f"{base_path}{file_name}.jsonl"
+                    rank0_print(f"Loading {full_path}")
+                    this_list_data_dict = []
+                    with open(full_path, "r") as file:
+                        for line in file:
+                            cur_data_dict = json.loads(line)
+                            this_list_data_dict.append(cur_data_dict)
+                    
+                    rank0_print(f"Loaded {len(this_list_data_dict)} samples from {full_path}")
+                    self.list_data_dict.extend(this_list_data_dict)
+            else:
+                base_path, file_pattern = re.match(r"^(.*)\{(.*)\}\.json$", data_path).groups()
+                file_names = file_pattern.split(",")
+                rank0_print(f"Loading {file_names} from {base_path}")
+                data_args.dataset_paths = []
+                for file_name in file_names:
+                    data_args.dataset_paths.append(f"{base_path}{file_name}.json")
+                    full_path = f"{base_path}{file_name}.json"
+                    rank0_print(f"Loading {full_path}")
+                    with open(full_path, "r") as file:
+                        cur_data_dict = json.load(file)
+                        rank0_print(f"Loaded {len(cur_data_dict)} samples from {full_path}")
+                        self.list_data_dict.extend(cur_data_dict)
         elif data_path.endswith(".yaml"):
             with open(data_path, "r") as file:
                 yaml_data = yaml.safe_load(file)
@@ -1190,56 +1208,27 @@ class LazySupervisedDataset(Dataset):
 
         elif "video" in sources[0]:
             video_file = self.list_data_dict[i]["video"]
-            video_folder = self.data_args.video_folder
+            video_folder = self.data_args.video_folder  # TODO 对于自定义数据来说，video_folder 似乎可以没有
             video_file = os.path.join(video_folder, video_file)
             suffix = video_file.split(".")[-1]
             if not os.path.exists(video_file):
                 print("File {} not exist!".format(video_file))
 
             try:
-                # print(f'\n========加载当前数据=======')
-                # print(f'sources:{sources}')
-                if 'gt_time_span' in self.list_data_dict[i]:
-                    gt_time_span = self.list_data_dict[i]["gt_time_span"] # [[]..]
+                if os.path.isdir(video_file):   # 说明是 增广数据 activityQA sharegpt4video
+                    video = process_video_after_preproecess(video_file)
+                    gt_frame_idx = self.list_data_dict[i]["gt_frame_idx"]
+                    # print(f'video.shape: {video.shape}')
+                    # print(f'gt_frame_idx: {gt_frame_idx}')
                 else:
-                    gt_time_span = None
-                # TODO
-                video, gt_frame_idx = process_video_with_pyav(video_file, self.data_args, gt_time_span=gt_time_span)
-
-
-                # using videoreader
-                # if "shareVideoGPTV" not in video_file and "liangke" not in video_file:
-                # vr = VideoReader(video_file, ctx=cpu(0))
-                # total_frame_num = len(vr)
-                # avg_fps = round(vr.get_avg_fps() / self.data_args.video_fps)
-                # frame_idx = [i for i in range(0, total_frame_num, avg_fps)]
-                # if self.data_args.frames_upbound > 0:
-                #     if len(frame_idx) > self.data_args.frames_upbound:
-                #         uniform_sampled_frames = np.linspace(0, total_frame_num - 1, self.data_args.frames_upbound, dtype=int)
-                #         frame_idx = uniform_sampled_frames.tolist()
-                # video = vr.get_batch(frame_idx).asnumpy()
-                # video = np.array(video)
-                # else:
-                #     if "liangke" in video_file:
-                #         video_file = self.list_data_dict[i]["video"]
-                #     frame_files = [os.path.join(video_file, f) for f in os.listdir(video_file) if os.path.isfile(os.path.join(video_file, f))]
-                #     frame_files.sort()  # Ensure the frames are sorted if they are named sequentially
-
-                #     # TODO: Hard CODE: Determine the indices for uniformly sampling 10 frames
-                #     num_frames_to_sample = 10
-                #     total_frames = len(frame_files)
-                #     sampled_indices = np.linspace(0, total_frames - 1, num_frames_to_sample, dtype=int)
-
-                #     # Read and store the sampled frames
-                #     video = []
-                #     for idx in sampled_indices:
-                #         frame_path = frame_files[idx]
-                #         try:
-                #             with Image.open(frame_path) as img:
-                #                 frame = img.convert("RGB")
-                #                 video.append(frame)
-                #         except IOError:
-                #             print(f"Failed to read frame at path: {frame_path}")
+                    # print(f'\n========加载当前数据=======')
+                    # print(f'sources:{sources}')
+                    if 'gt_time_span' in self.list_data_dict[i]:
+                        gt_time_span = self.list_data_dict[i]["gt_time_span"] # [[]..]
+                    else:
+                        gt_time_span = None
+                    # TODO
+                    video, gt_frame_idx = process_video_with_pyav(video_file, self.data_args, gt_time_span=gt_time_span)
 
                 processor = self.data_args.image_processor
                 image = processor.preprocess(video, return_tensors="pt")["pixel_values"]
@@ -1278,7 +1267,7 @@ class LazySupervisedDataset(Dataset):
         if prompt is not None:
             data_dict["prompt"] = prompt
 
-        if gt_time_span is not None:
+        if len(gt_frame_idx) > 0:
             data_dict["gt_frame_idx"] = gt_frame_idx
 
         data_dict["id"] = self.list_data_dict[i].get("id", i)
@@ -1494,7 +1483,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                         **customized_kwargs,
                         )
                 else:   # NOTE: load model from there
-                    # TODO load videoxl has trained; check its kwargs
+                    # TODO There is need more stable config load method
                     model = LlavaQwenForCausalLM.from_pretrained(
                         model_args.trained_model_name_or_path,
                         cache_dir=training_args.cache_dir,
@@ -1502,8 +1491,8 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                         torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
                         low_cpu_mem_usage=False,
                         reload_enable=model_args.reload_enable,
-                        reload_top_k=model_args.reload_top_k
-                        # **customized_kwargs,
+                        reload_top_k=model_args.reload_top_k,
+                        beacon_ratio = model_args.beacon_ratio
                     )
 
         elif "gemma" in model_args.model_name_or_path.lower():

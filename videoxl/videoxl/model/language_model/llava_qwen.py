@@ -884,7 +884,7 @@ class Qwen2SdpaAttention(Qwen2Attention):
         past_key_value = (key_states, value_states, beacon_size, beacon_indices, None)
         
         # NOTE: custom code: store the key_states_for_retrieval for every chunk
-        if memory.reload_enable and layer_idx != 0 and beacon_size != 0:
+        if memory.reload_enable and layer_idx != 0 and beacon_size != 0 and q_len != 1:
 
             key_states_for_retrieval = self.k_proj_with_retrieval(hidden_states, beacon_size, beacon_indices)
 
@@ -901,7 +901,7 @@ class Qwen2SdpaAttention(Qwen2Attention):
             value_states = torch.cat([past_value, value_states], dim=2)
 
         # NOTE: custom code: prepare for retrieval  
-        if memory.reload_enable and layer_idx != 0 and beacon_size == 0 and past_key is not None:
+        if memory.reload_enable and layer_idx != 0 and beacon_size == 0 and past_key is not None and q_len != 1:
             original_query_states = query_states
             original_key_states = key_states.clone()
             original_value_states = value_states.clone()
@@ -930,7 +930,7 @@ class Qwen2SdpaAttention(Qwen2Attention):
         lmk_loss = None
         # if memory.prefill_finished and not memory.has_reloaded and memory.reload_enable and layer_idx != 0:
 
-        if memory.reload_enable and layer_idx != 0 and beacon_size == 0 and past_key is not None:
+        if memory.reload_enable and layer_idx != 0 and beacon_size == 0 and past_key is not None and q_len != 1:
 
             record_for_print = {
                 'layer_idx':layer_idx,
@@ -984,7 +984,7 @@ class Qwen2SdpaAttention(Qwen2Attention):
             q_reps = torch.nn.functional.normalize(query_reps_mean_pooling, dim=-1)
             p_reps = torch.nn.functional.normalize(key_reps_mean_pooling, dim=-1)
             # p_reps = torch.nn.functional.normalize(key_reps, dim=-1)
-
+                
             # shape: bsz, chunk num
             scores = self.compute_similarity(q_reps, p_reps) / temperature
         
@@ -992,8 +992,8 @@ class Qwen2SdpaAttention(Qwen2Attention):
             # target_layers = [3,7,11,15,19,23] # 在 bf 16 精度下，前两层和最后一层 score 区分不明显
             target_layers = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27]
 
-            ground_truth_pos = list(set(ground_truth_pos))
             if layer_idx in target_layers and ground_truth_pos is not None:
+                ground_truth_pos = list(set(ground_truth_pos))
                 total_pos_num = len(ground_truth_pos)
                 if total_pos_num != 0:
                     target = torch.tensor([1 if i in ground_truth_pos else 0 for i in range(scores_len)], device=scores.device, dtype=torch.long)
@@ -1004,7 +1004,16 @@ class Qwen2SdpaAttention(Qwen2Attention):
                 lmk_loss = None
             
             topk_values, topk_indices = torch.topk(scores[:], k=min(memory.reload_top_k, len(scores)))
-            total_pos_num_for_print = len(ground_truth_pos)
+            
+            if ground_truth_pos is not None:
+                total_pos_num_for_print = len(ground_truth_pos)
+            else:
+                total_pos_num_for_print = None
+
+            try:
+                eval_logger.log('MyEval', f'Retrieval:{{"layer_idx":{layer_idx}, "topk_indices":{topk_indices.tolist()}, "scores":{scores.tolist()}}}')
+            except:
+                pass
 
             if random.random() < 0.01 and layer_idx in target_layers:
                 print(f'='*100)
@@ -1230,10 +1239,7 @@ class Qwen2FlashAttention2(Qwen2Attention):
         if memory.prefill_finished and not memory.has_reloaded and memory.reload_enable:
             print('进入prefill的最后一步，此时query是 instructin，需要进行检索')
             this_layer_offload_activations = memory.offload_activations[layer_idx]
-            eval_logger.debug(f'载入这一层，之前存储的 raw kv')
-            eval_logger.debug(f'一共有：{len(this_layer_offload_activations)}')
-            for idx, tmp in enumerate(this_layer_offload_activations):
-                eval_logger.debug(f'chunk: {idx} shape: {tmp[0].shape}')
+        
             
             print('打印chunk info:')
             for chunk_info in memory.chunk_infos[:-1]: # TODO: fix this, the last one is usually insturction, so this isn't should be included into chunk_infos
@@ -1241,9 +1247,7 @@ class Qwen2FlashAttention2(Qwen2Attention):
 
             chunk_len = len(memory.chunk_infos) - 1
             chunk_idx_selected = random.randint(1, chunk_len-1) # TODO need to fix,  the first chunk is not always skip. need a more wisely stragedy
-            eval_logger.debug(f'随机选中的 chunk: {chunk_idx_selected}')
             chunk_info = memory.chunk_infos[chunk_idx_selected]
-            eval_logger.debug(f'随机选中的 chunk: {chunk_info}')
             start_idx = chunk_info[1]
             end_idx = chunk_info[2]
 
@@ -1253,28 +1257,18 @@ class Qwen2FlashAttention2(Qwen2Attention):
             reload_k_states = this_chunk_raw_activation[0]
             reload_v_states = this_chunk_raw_activation[-1]
             # update beacon activation
-            eval_logger.debug(f'执行reload_kv_into_beacon_activation：')
             memory.reload_kv_into_beacon_activation(reload_k_states, reload_v_states, chunk_info, layer_idx)
             
             # concat
-            eval_logger.debug(f'original_key_states.shape: {original_key_states.shape}')
             key_states_with_reload = torch.cat((original_key_states[:,:,:start_idx,:], reload_k_states, original_key_states[:,:,start_idx:,:]), dim=2)
             val_states_with_reload = torch.cat((original_value_states[:,:,:start_idx,:], reload_v_states, original_value_states[:,:,start_idx:,:]), dim=2)
 
-            eval_logger.debug(f'key_states_with_reload.shape: {key_states_with_reload.shape}')
-
             # allocate on GPU and attend calulate
-            eval_logger.debug(f'dtype: {key_states_with_reload.dtype}')
-            eval_logger.debug(f'device: {key_states_with_reload.device}')
             key_states_with_reload = key_states_with_reload.to(key_states.device)
             val_states_with_reload = val_states_with_reload.to(key_states.device)
-            eval_logger.debug(f'dtype: {key_states_with_reload.dtype}')
-            eval_logger.debug(f'device: {key_states_with_reload.device}')
 
             # new position_ids TODO check its content
-            eval_logger.debug(f'original position_ids: {position_ids}')
             position_ids = torch.arange(key_states_with_reload.shape[2], dtype=torch.long, device=key_states.device).repeat(key_states_with_reload.shape[0], 1)
-            eval_logger.debug(f'original position_ids: {position_ids}')
 
             # The last layer
             if layer_idx == self.config.num_hidden_layers-1:
@@ -2094,8 +2088,6 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         video_id=None
     ):
 
-        print(f'now video: {video_id}')
-
         self.memory.prepare(
             input_ids=input_ids, 
             attention_mask=attention_mask, 
@@ -2213,8 +2205,6 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         # if random.random() < 0.00001 :
         #     print(f'after outputs loss: {outputs.loss}')
         #     print(f'after outputs batch_loss: {outputs.batch_loss}')
-
-        print(f'finished video: {video_id}')
 
         return outputs
 

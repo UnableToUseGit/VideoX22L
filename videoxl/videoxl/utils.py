@@ -4,7 +4,7 @@ import logging.handlers
 import os
 import sys
 import numpy as np
-
+from PIL import Image
 import requests
 
 from videoxl.constants import LOGDIR
@@ -23,6 +23,26 @@ try:
 except ImportError:
     print("Please install pyav to use video processing functions.")
 
+def process_video_after_preproecess(video_file):
+    # 这类数据已经平均采样过了，所以直接读入图片即可
+    frame_names = os.listdir(video_file)
+    frame_paths = [ os.path.join(video_file, name) for name in frame_names ]
+
+    # 排序文件名，确保帧的顺序正确（如果文件名是按照帧顺序命名的）
+    frame_paths.sort(key=lambda x: int(x.split('.')[-2].split('_')[-1]))
+
+    video_frames = []
+    # 读取每一帧图片，转换为RGB格式，并转换为NumPy数组
+    for frame_path in frame_paths:
+        # 打开图像文件
+        with Image.open(frame_path) as img:
+            # 转换为RGB格式
+            img_rgb = img.convert('RGB')
+            # 转换为NumPy数组，并将其添加到帧列表中
+            video_frames.append(np.array(img_rgb))
+
+    video = np.stack(video_frames)  # 560x720, 高x宽
+    return video
 
 def process_video_with_pyav(video_file, data_args, gt_time_span=None):
     container = av.open(video_file)

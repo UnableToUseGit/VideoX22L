@@ -304,22 +304,6 @@ def find_all_linear_names(model):
     return list(lora_module_names)
 
 
-def find_retrieval_linear_names(model):
-    cls = torch.nn.Linear
-    lora_module_names = set()
-    multimodal_keywords = ["mm_projector", "vision_tower", "vision_resampler"]
-    for name, module in model.named_modules():
-        if any(mm_keyword in name for mm_keyword in multimodal_keywords):
-            continue
-        if isinstance(module, cls):
-            names = name.split(".")
-            if 'retrieval' in name: 
-                lora_module_names.add(names[0] if len(names) == 1 else names[-1])
-
-    if "lm_head" in lora_module_names:  # needed for 16-bit
-        lora_module_names.remove("lm_head")
-    return list(lora_module_names)
-
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
     """Collects the state dict and dump to disk."""
     if hasattr(trainer.args, "tune_mm_mlp_adapter") and trainer.args.tune_mm_mlp_adapter:
@@ -1167,20 +1151,18 @@ class LazySupervisedDataset(Dataset):
             raise e
 
     def _get_item(self, i) -> Dict[str, torch.Tensor]:
-        sources = self.list_data_dict[i]    # json fiel content, a dict, id, image, conversation
+        sources = self.list_data_dict[i]
         if isinstance(i, int):
             sources = [sources]
         assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
-        print(f'sources:{sources}')
+
         if "image" in sources[0]:
             image_file = self.list_data_dict[i]["image"]
             if type(image_file) is list:
                 image = [self.process_image(f) for f in image_file]
             else:
-                image = [self.process_image(image_file)]    # convert to tensor
-            sources = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]), self.data_args)   # 处理文本
-            print(f'sources_after_mm:{sources}')
-            print(f'image:{image}')
+                image = [self.process_image(image_file)]
+            sources = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]), self.data_args)
 
         elif "video" in sources[0]:
             video_file = self.list_data_dict[i]["video"]
@@ -1191,12 +1173,7 @@ class LazySupervisedDataset(Dataset):
                 print("File {} not exist!".format(video_file))
 
             try:
-                if 'gt_time_span' in self.list_data_dict[i]:
-                    gt_time_span = self.list_data_dict[i]["gt_time_span"] # [[]..]
-                else:
-                    gt_time_span = None
-                video, gt_frame_idx = process_video_with_pyav(video_file, self.data_args, gt_time_span=gt_time_span)
-
+                video = process_video_with_pyav(video_file, self.data_args)
                 # using videoreader
                 # if "shareVideoGPTV" not in video_file and "liangke" not in video_file:
                 # vr = VideoReader(video_file, ctx=cpu(0))
@@ -1243,7 +1220,7 @@ class LazySupervisedDataset(Dataset):
             sources = copy.deepcopy([e["conversations"] for e in sources])
 
         has_image = ("image" in self.list_data_dict[i]) or ("video" in self.list_data_dict[i])
-        data_dict = preprocess(sources, self.tokenizer, has_image=has_image)    # get input_ids and labels
+        data_dict = preprocess(sources, self.tokenizer, has_image=has_image)
 
         if "prompt" in data_dict:
             prompt = data_dict["prompt"]
@@ -1268,11 +1245,8 @@ class LazySupervisedDataset(Dataset):
         if prompt is not None:
             data_dict["prompt"] = prompt
 
-        if gt_time_span is not None:
-            data_dict["gt_frame_idx"] = gt_frame_idx
-
         data_dict["id"] = self.list_data_dict[i].get("id", i)
-        # 最终 data_dict 有 input_ids 和 labels, 也有image的tensor形式，还有 id， prompt
+
         return data_dict
 
 
@@ -1320,13 +1294,6 @@ class DataCollatorForSupervisedDataset(object):
         if "prompt" in instances[0]:
             batch["prompts"] = [instance["prompt"] for instance in instances]
 
-        batch["gt_frame_idx"] = []
-        for inst in instances:
-            if "gt_frame_idx" in inst:
-                batch["gt_frame_idx"].append(inst["gt_frame_idx"])
-            else:
-                batch["gt_frame_idx"].append(None)        
-
         return batch
 
 
@@ -1372,7 +1339,6 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
     overwrite_config["beacon_embed_init"] = "eos"
     overwrite_config["enable_beacon"]=model_args.enable_beacon
     overwrite_config["beacon_accum"]=model_args.beacon_accum
-
     if model_args.use_pos_skipping is not None and model_args.pos_skipping_range is not None:
         overwrite_config["use_pos_skipping"] = model_args.use_pos_skipping
         overwrite_config["pos_skipping_range"] = model_args.pos_skipping_range
@@ -1405,7 +1371,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
             setattr(cfg_pretrained, k, v)
 
         customized_kwargs["config"] = cfg_pretrained
-    pdb.set_trace()
+
     if model_args.model_class_name is not None:
         actual_model_class_name = f"{model_args.model_class_name}ForCausalLM"
         model_class = getattr(transformers, actual_model_class_name)
@@ -1479,8 +1445,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                         low_cpu_mem_usage=False,
                         **customized_kwargs,
                         )
-                else:   # NOTE: load model from there
-                    # TODO load videoxl has trained; check its kwargs
+                else:
                     model = LlavaQwenForCausalLM.from_pretrained(
                         model_args.model_name_or_path,
                         cache_dir=training_args.cache_dir,
@@ -1489,7 +1454,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                         low_cpu_mem_usage=False,
                         **customized_kwargs,
                     )
-                    pdb.set_trace()
+                    
         elif "gemma" in model_args.model_name_or_path.lower():
             model = LlavaGemmaForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
@@ -1517,6 +1482,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
 
 def train(attn_implementation=None):
     global local_rank
+
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
   
@@ -1575,7 +1541,7 @@ def train(attn_implementation=None):
 
     if training_args.gradient_checkpointing:
         if hasattr(model, "enable_input_require_grads"):
-            model.enable_input_require_grads() 
+            model.enable_input_require_grads()
         else:
 
             def make_inputs_require_grad(module, input, output):
@@ -1585,17 +1551,15 @@ def train(attn_implementation=None):
 
     if training_args.lora_enable:
         from peft import LoraConfig, get_peft_model
-        # find_all_linear_names will find all of linear layers in the model except ["mm_projector", "vision_tower", "vision_resampler"]
-        # TODO target 只包括 retrieval linear layer
+
         lora_config = LoraConfig(
             r=training_args.lora_r,
             lora_alpha=training_args.lora_alpha,
-            target_modules = find_retrieval_linear_names(model),
+            target_modules=find_all_linear_names(model),
             lora_dropout=training_args.lora_dropout,
             bias=training_args.lora_bias,
             task_type="CAUSAL_LM",
         )
-        pdb.set_trace()
         if training_args.bits == 16:
             if training_args.bf16:
                 model.to(torch.bfloat16)
@@ -1608,7 +1572,6 @@ def train(attn_implementation=None):
         tokenizer = transformers.AutoTokenizer.from_pretrained(model_args.model_name_or_path, cache_dir=training_args.cache_dir, model_max_length=training_args.model_max_length, padding_side="left")
     elif "qwen" in model_args.model_name_or_path.lower():
         tokenizer = transformers.AutoTokenizer.from_pretrained(model_args.model_name_or_path, cache_dir=training_args.cache_dir, model_max_length=training_args.model_max_length, padding_side="right")
-        pdb.set_trace()
     elif (
         "wizardlm-2" in model_args.model_name_or_path.lower()
         or "vicuna" in model_args.model_name_or_path.lower()
@@ -1642,9 +1605,9 @@ def train(attn_implementation=None):
             conversation_lib.default_conversation = conversation_lib.conv_templates[model_args.version]
         else:
             conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1"]
-    pdb.set_trace()
-    if model_args.vision_tower is not None: # NOTE: here load mm_projector, vision resampler, 
-        # model.get_model().initialize_vision_modules(model_args=model_args, fsdp=training_args.fsdp)
+
+    if model_args.vision_tower is not None:
+        model.get_model().initialize_vision_modules(model_args=model_args, fsdp=training_args.fsdp)
 
         vision_tower = model.get_vision_tower()
         vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
@@ -1678,8 +1641,7 @@ def train(attn_implementation=None):
         model.config.tokenizer_padding_side = tokenizer.padding_side
         model.config.tokenizer_model_max_length = tokenizer.model_max_length
 
-        ### NOTE: Deciding train which part of the model
-        pdb.set_trace() # TODO 改为全部冻结
+        ### Deciding train which part of the model
         if model_args.mm_tunable_parts is None:  # traditional way of deciding which part to train
             model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
             model.config.tune_mm_vision_resampler = training_args.tune_mm_vision_resampler = model_args.tune_mm_vision_resampler
@@ -1760,7 +1722,7 @@ def train(attn_implementation=None):
                 if hasattr(module, "weight"):
                     if training_args.bf16 and module.weight.dtype == torch.float32:
                         module = module.to(torch.bfloat16)
-    # make dataset
+
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
 
     if training_args.pretrain:
