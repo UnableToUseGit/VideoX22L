@@ -975,10 +975,10 @@ class Qwen2SdpaAttention(Qwen2Attention):
                 reload_k_states = this_chunk_raw_activation[0]
                 reload_v_states = this_chunk_raw_activation[-1]
 
-                # update beacon activation
+                # update beacon activation TODO another reload method
                 memory.reload_kv_into_beacon_activation(reload_k_states, reload_v_states, chunk_info, layer_idx)
                 
-                # concat
+                # concat TODO another reload method
                 key_states_with_reload = torch.cat((key_states_with_reload[:,:,:start_idx,:], reload_k_states, key_states_with_reload[:,:,start_idx:,:]), dim=2)
                 val_states_with_reload = torch.cat((val_states_with_reload[:,:,:start_idx,:], reload_v_states, val_states_with_reload[:,:,start_idx:,:]), dim=2)
 

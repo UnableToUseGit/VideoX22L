@@ -268,7 +268,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
         if mm_use_im_start_end:
             tokenizer.add_tokens([DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True)
         # model.resize_token_embeddings(len(tokenizer))
-        model.resize_token_embeddings(model.config.vocab_size+1)    # adjust VST token
+        # model.resize_token_embeddings(model.config.vocab_size+1)    # adjust VST token
 
         vision_tower = model.get_vision_tower()
         if not vision_tower.is_loaded:

@@ -208,7 +208,7 @@ class TrainingArguments(transformers.TrainingArguments):
     auto_find_batch_size: bool = field(default=False)
     gradient_checkpointing: bool = field(default=True)
     verbose_logging: bool = field(default=False)
-    attn_implementation: str = field(default="flash_attention_2", metadata={"help": "Use transformers attention implementation."})
+    attn_implementation: str = field(default="sdpa", metadata={"help": "Use transformers attention implementation."})
 
     group_by_stride: str = "none"
     sort_by_stride: Optional[str] = None
@@ -1173,7 +1173,7 @@ class LazySupervisedDataset(Dataset):
                 print("File {} not exist!".format(video_file))
 
             try:
-                video = process_video_with_pyav(video_file, self.data_args)
+                video, _ = process_video_with_pyav(video_file, self.data_args)
                 # using videoreader
                 # if "shareVideoGPTV" not in video_file and "liangke" not in video_file:
                 # vr = VideoReader(video_file, ctx=cpu(0))
