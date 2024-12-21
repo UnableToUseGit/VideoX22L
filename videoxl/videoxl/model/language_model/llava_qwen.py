@@ -853,9 +853,14 @@ class Qwen2SdpaAttention(Qwen2Attention):
             value_states = value_states.contiguous()
 
         lmk_loss = None
-        # if memory.prefill_finished and not memory.has_reloaded and memory.reload_enable and layer_idx != 0:
 
-        if memory.reload_enable and layer_idx != 0 and beacon_size == 0 and past_key is not None and q_len != 1:
+        # target_layers = [3,7,11,15,19,23] # 在 bf 16 精度下，前两层和最后一层 score 区分不明显
+        # target_layers = [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27]
+        # 中间层检索效果更好
+        # TODO 这里需要一个更加 stable 的 target layer 指定 来区分训练和推理  这又提醒了我一个BUG，就是在训练 direct on beacon proj 的时候，这两个没区分好，训练时应该只有个别的层 要 retrieval，我之前弄成了所有的层都要 retrieval 但是只有个别的有 loss. 这个地方我并不确定，需要问问罗坤
+        target_layers = [10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26]
+
+        if memory.reload_enable and layer_idx in target_layers and beacon_size == 0 and past_key is not None and q_len != 1:
 
             record_for_print = {
                 'layer_idx':layer_idx,
@@ -914,8 +919,6 @@ class Qwen2SdpaAttention(Qwen2Attention):
             scores = self.compute_similarity(q_reps, p_reps) / temperature
         
             scores_len = scores.size(-1)
-            target_layers = [3, 7, 11, 13, 15, 17, 19, 21, 23, 25, 27] # 在 bf 16 精度下，前两层和最后一层 score 区分不明显
-            # target_layers = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27]
 
             if layer_idx in target_layers and ground_truth_pos is not None:
                 ground_truth_pos = list(set(ground_truth_pos))
@@ -940,6 +943,9 @@ class Qwen2SdpaAttention(Qwen2Attention):
             except:
                 pass
 
+            # random mode
+            # topk_indices = random.sample(range(len(effective_chunk_infos)), memory.reload_top_k)
+
             if random.random() < 0.01 and layer_idx in target_layers:
                 print(f'='*100)
                 print(f'layer_idx: {layer_idx}')
@@ -948,12 +954,11 @@ class Qwen2SdpaAttention(Qwen2Attention):
                 print(f'scores: {scores}')
                 print(f'total_pos_num: {total_pos_num_for_print}')
                 print(f'lmk_loss: {lmk_loss}')
+                print(f'effective_chunk_infos: {effective_chunk_infos}')
+                print(f'target_layers: {target_layers}')
                 print(f'='*100)
             
             this_layer_offload_activations = memory.offload_activations[layer_idx]
-
-            # random mode
-            # topk_indices = random.sample(range(len(effective_chunk_infos)), memory.reload_top_k)
 
             record_for_print['topk_values'] = topk_values
             record_for_print['topk_indices'] = topk_indices
@@ -961,26 +966,61 @@ class Qwen2SdpaAttention(Qwen2Attention):
             record_for_print['ground_truth_pos'] = ground_truth_pos
             record_for_print['lmk_loss'] = lmk_loss
 
-            key_states_with_reload = original_key_states
-            val_states_with_reload = original_value_states
+            # reload states
+            final_length = original_key_states.size(2)
+            sorted_topk_indices, _ = torch.sort(topk_indices)
+            for indice in sorted_topk_indices:
+                chunk_info = effective_chunk_infos[indice]
+                chunk_idx_selected = chunk_info[0]
+                reload_length = this_layer_offload_activations[chunk_idx_selected][0].size(2)  # 时间维度
+                final_length += reload_length - (chunk_info[2] - chunk_info[1])  # 增加新块长度，减去覆盖长度
 
-            for indice in topk_indices:
+            # 创建目标张量
+            key_states_with_reload = torch.zeros(
+                (original_key_states.size(0), original_key_states.size(1), final_length, original_key_states.size(3)),
+                dtype=original_key_states.dtype, device=original_key_states.device
+            )
+            val_states_with_reload = torch.zeros(
+                (original_value_states.size(0), original_value_states.size(1), final_length, original_value_states.size(3)),
+                dtype=original_value_states.dtype, device=original_value_states.device
+            )
+
+            pointer_i = 0
+            pointer_j = 0
+            for indice in sorted_topk_indices:
                 chunk_info = effective_chunk_infos[indice]
                 chunk_idx_selected = chunk_info[0]
                 start_idx = chunk_info[1]
                 end_idx = chunk_info[2]
+                chunk_len = start_idx - pointer_i
+
+                if chunk_len != 0:
+                    key_states_with_reload[:, :, pointer_j:pointer_j + chunk_len, :] = original_key_states[:, :, pointer_i:start_idx, :]
+                    val_states_with_reload[:, :, pointer_j:pointer_j + chunk_len, :] = original_value_states[:, :, pointer_i:start_idx, :]
+                    # update
+                    pointer_j = pointer_j + chunk_len
+                    pointer_i = start_idx
+
+
                 # insert these retrieved chunk activation into current
                 this_chunk_raw_activation = this_layer_offload_activations[chunk_idx_selected]
                 # get it
                 reload_k_states = this_chunk_raw_activation[0]
                 reload_v_states = this_chunk_raw_activation[-1]
 
-                # update beacon activation TODO another reload method
-                memory.reload_kv_into_beacon_activation(reload_k_states, reload_v_states, chunk_info, layer_idx)
+                reload_chunk_len = reload_k_states.size(2)
+                key_states_with_reload[:, :, pointer_j:pointer_j + reload_chunk_len, :] = reload_k_states
+                val_states_with_reload[:, :, pointer_j:pointer_j + reload_chunk_len, :] = reload_v_states
+
+                # update
+                pointer_j = pointer_j + reload_chunk_len
+                pointer_i = end_idx
                 
-                # concat TODO another reload method
-                key_states_with_reload = torch.cat((key_states_with_reload[:,:,:start_idx,:], reload_k_states, key_states_with_reload[:,:,start_idx:,:]), dim=2)
-                val_states_with_reload = torch.cat((val_states_with_reload[:,:,:start_idx,:], reload_v_states, val_states_with_reload[:,:,start_idx:,:]), dim=2)
+            if pointer_i != original_key_states.size(2):
+                key_states_with_reload[:, :, pointer_j:, :] = original_key_states[:, :, pointer_i:, :]
+                val_states_with_reload[:, :, pointer_j:, :] = original_value_states[:, :, pointer_i:, :]
+
+            memory.reload_kv_into_beacon_activation(key_states_with_reload, val_states_with_reload, layer_idx)
 
             # generate new attention mask for sdpa, and new_kv_seq_len
             tgt_size = attention_mask.shape[-2]

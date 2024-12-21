@@ -214,18 +214,32 @@ class Memory(torch.nn.Module):
         return sink_memory_size, beacon_memory_size, raw_memory_size
 
     # NOTE: reload from offload
-    def reload_kv_into_beacon_activation(self, k_states_reloaded, v_states_reloaded, chunk_info, layer_idx):
+    # def reload_kv_into_beacon_activation(self, k_states_reloaded, v_states_reloaded, chunk_info, layer_idx):
         
-        start_idx = chunk_info[1]
-        sink_key, sink_value = self.sink_activations[layer_idx]
-        beacon_key, beacon_value = self.beacon_activations[layer_idx]
-        k_activation = cat_tensor([sink_key, beacon_key], dim=self.k_seq_dim)
-        v_activation = cat_tensor([sink_value, beacon_value], dim=self.v_seq_dim)
-        k_activation_cat_reload = torch.cat((k_activation[:,:,:start_idx,:], k_states_reloaded, k_activation[:,:,start_idx:,:]), dim=2)
-        v_activation_cat_reload = torch.cat((v_activation[:,:,:start_idx,:], v_states_reloaded, v_activation[:,:,start_idx:,:]), dim=2)
+    #     start_idx = chunk_info[1]
+    #     end_idx = chunk_info[1]
+    #     sink_key, sink_value = self.sink_activations[layer_idx]
+    #     beacon_key, beacon_value = self.beacon_activations[layer_idx]
+    #     k_activation = cat_tensor([sink_key, beacon_key], dim=self.k_seq_dim)
+    #     v_activation = cat_tensor([sink_value, beacon_value], dim=self.v_seq_dim)
+    #     k_activation_cat_reload = torch.cat((k_activation[:,:,:start_idx,:], k_states_reloaded, k_activation[:,:,start_idx:,:]), dim=2)
+    #     v_activation_cat_reload = torch.cat((v_activation[:,:,:start_idx,:], v_states_reloaded, v_activation[:,:,start_idx:,:]), dim=2)
         
-        beacon_key_cat_reload = k_activation_cat_reload[:,:,sink_key.shape[2]:,:]
-        beacon_value_cat_reload = v_activation_cat_reload[:,:,sink_key.shape[2]:,:]
+    #     beacon_key_cat_reload = k_activation_cat_reload[:,:,sink_key.shape[2]:,:]
+    #     beacon_value_cat_reload = v_activation_cat_reload[:,:,sink_key.shape[2]:,:]
+    #     # update
+    #     self.beacon_activations[layer_idx] = (beacon_key_cat_reload, beacon_value_cat_reload)
+    
+    def reload_kv_into_beacon_activation(self, key_states_with_reload, value_states_with_reload, layer_idx):
+
+        first_chunk = self.chunk_infos[0]
+        last_chunk = self.chunk_infos[-1]
+        first_chunk_end_idx = first_chunk[-1]
+        last_chunk_start_idx = last_chunk[-2] - last_chunk[-1]
+
+        beacon_key_cat_reload = key_states_with_reload[:,:,first_chunk_end_idx:last_chunk_start_idx,:]
+        beacon_value_cat_reload = value_states_with_reload[:,:,first_chunk_end_idx:last_chunk_start_idx,:]
+
         # update
         self.beacon_activations[layer_idx] = (beacon_key_cat_reload, beacon_value_cat_reload)
 
