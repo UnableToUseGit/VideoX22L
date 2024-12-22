@@ -26,6 +26,7 @@ class Memory(torch.nn.Module):
         v_seq_dim:int=2, 
         reload_enable = False,
         reload_top_k = 3,
+        only_lmk_loss = False,
     ):
         """Setup necessary attributes."""
         super().__init__()
@@ -48,6 +49,9 @@ class Memory(torch.nn.Module):
         self.chunk_infos = []
         self.reload_top_k = reload_top_k
         print(f'使用的 top_k={self.reload_top_k}')
+
+        self.only_lmk_loss = only_lmk_loss
+        print(f'only_lmk_loss: {self.only_lmk_loss}')
     
     @property
     def beacon_token(self):
@@ -908,8 +912,6 @@ class Memory(torch.nn.Module):
         Override loss with accumulated loss. Update the next-token logits.
         """
 
-        # TODO lmk loss 应该怎么加
-
         # override loss
         if self.batch_loss is not None:
             # here the batch_loss is the summation of all token losses in each element
@@ -933,11 +935,12 @@ class Memory(torch.nn.Module):
             model_outputs["logits"] = logits[:, beacon_indices == 0]
         
         if lmk_loss is not None:
-            # if "loss" in model_outputs and model_outputs["loss"] is not None:
-            #     model_outputs["loss"] = model_outputs["loss"] + lmk_loss
-            # else:
-            model_outputs["loss"] = lmk_loss
-            model_outputs["batch_loss"] = lmk_loss
+            if self.only_lmk_loss:
+                model_outputs["loss"] = lmk_loss
+                model_outputs["batch_loss"] = lmk_loss
+            else:
+                model_outputs["loss"] = model_outputs["loss"] + lmk_loss
+                model_outputs["batch_loss"] = model_outputs["batch_loss"] + lmk_loss
 
         return model_outputs
 

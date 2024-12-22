@@ -1,4 +1,3 @@
-from videoxl.train.train import train
 from videoxl.train.train_only_retriever import train
 import wandb
 import os

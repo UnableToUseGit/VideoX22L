@@ -854,13 +854,8 @@ class Qwen2SdpaAttention(Qwen2Attention):
 
         lmk_loss = None
 
-        # target_layers = [3,7,11,15,19,23] # 在 bf 16 精度下，前两层和最后一层 score 区分不明显
-        # target_layers = [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27]
-        # 中间层检索效果更好
-        # TODO 这里需要一个更加 stable 的 target layer 指定 来区分训练和推理  这又提醒了我一个BUG，就是在训练 direct on beacon proj 的时候，这两个没区分好，训练时应该只有个别的层 要 retrieval，我之前弄成了所有的层都要 retrieval 但是只有个别的有 loss. 这个地方我并不确定，需要问问罗坤
-        target_layers = [10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26]
-
-        if memory.reload_enable and layer_idx in target_layers and beacon_size == 0 and past_key is not None and q_len != 1:
+        reload_target_layers = [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27]
+        if memory.reload_enable and layer_idx in reload_target_layers and beacon_size == 0 and past_key is not None and q_len != 1:
 
             record_for_print = {
                 'layer_idx':layer_idx,
@@ -920,12 +915,13 @@ class Qwen2SdpaAttention(Qwen2Attention):
         
             scores_len = scores.size(-1)
 
-            if layer_idx in target_layers and ground_truth_pos is not None:
+            loss_target_layers = [3,7,11,13,15,17,19,23,27]
+            if layer_idx in loss_target_layers and ground_truth_pos is not None:
                 ground_truth_pos = list(set(ground_truth_pos))
                 total_pos_num = len(ground_truth_pos)
                 if total_pos_num != 0:
                     target = torch.tensor([1 if i in ground_truth_pos else 0 for i in range(scores_len)], device=scores.device, dtype=torch.long)
-                    lmk_loss = self.LMKLoss(scores.unsqueeze(dim=0), target.unsqueeze(dim=0), total_pos_num) / len(target_layers)
+                    lmk_loss = self.LMKLoss(scores.unsqueeze(dim=0), target.unsqueeze(dim=0), total_pos_num) / len(loss_target_layers)
                 else:
                     lmk_loss = None
             else:
@@ -946,7 +942,7 @@ class Qwen2SdpaAttention(Qwen2Attention):
             # random mode
             # topk_indices = random.sample(range(len(effective_chunk_infos)), memory.reload_top_k)
 
-            if random.random() < 0.01 and layer_idx in target_layers:
+            if random.random() < 0.01 and layer_idx in loss_target_layers:
                 print(f'='*100)
                 print(f'layer_idx: {layer_idx}')
                 print(f'ground_truth_pos: {ground_truth_pos}')
@@ -955,7 +951,7 @@ class Qwen2SdpaAttention(Qwen2Attention):
                 print(f'total_pos_num: {total_pos_num_for_print}')
                 print(f'lmk_loss: {lmk_loss}')
                 print(f'effective_chunk_infos: {effective_chunk_infos}')
-                print(f'target_layers: {target_layers}')
+                print(f'loss_target_layers: {loss_target_layers}')
                 print(f'='*100)
             
             this_layer_offload_activations = memory.offload_activations[layer_idx]
@@ -1935,6 +1931,8 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         """Override the default from_pretrained to extend vocab size according to beacon_size."""
         reload_enable = kwargs.pop('reload_enable', False)
         reload_top_k = kwargs.pop('reload_top_k', 3)
+        only_lmk_loss = kwargs.pop('only_lmk_loss', False)
+
         kwargs.update(output_loading_info=True)
         model, loading_info = super().from_pretrained(*args, **kwargs)
 
@@ -1945,9 +1943,10 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             k_seq_dim=2,
             v_seq_dim=2,
             reload_enable=reload_enable,  
-            reload_top_k=reload_top_k
+            reload_top_k=reload_top_k,
+            only_lmk_loss=only_lmk_loss
         )
-
+        
         missing_keys = loading_info["missing_keys"]
         # NOTE: the beacon parameters may or may not be loaded from the checkpoint
         # if it is loaded from the checkpoint, we should not re-initilize it

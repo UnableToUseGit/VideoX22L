@@ -62,9 +62,9 @@ IS_TOKENIZER_GREATER_THAN_0_14 = version.parse(tokenizers.__version__) >= versio
 class ModelArguments:
     reload_enable: bool = field(default=False)
     reload_top_k: Optional[int] = field(default=3)
+    only_lmk_loss: bool = field(default=False)  # TODO
 
     model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
-    trained_model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
     model_class_name: Optional[str] = field(default=None, metadata={"help": "Used to init model class, format is XXXXForCausalLM. e.g. currently XXXX is chosen from LlavaLlama, LlavaMixtral, LlavaMistral, Llama"})
 
     mm_tunable_parts: Optional[str] = field(
@@ -214,7 +214,6 @@ class TrainingArguments(transformers.TrainingArguments):
     auto_find_batch_size: bool = field(default=False)
     gradient_checkpointing: bool = field(default=True)
     verbose_logging: bool = field(default=False)
-    # attn_implementation: str = field(default="flash_attention_2", metadata={"help": "Use transformers attention implementation."})
     attn_implementation: str = field(default="sdpa", metadata={"help": "Use transformers attention implementation."})
 
     group_by_stride: str = "none"
@@ -305,39 +304,6 @@ def find_all_linear_names(model):
         if isinstance(module, cls):
             names = name.split(".")
             lora_module_names.add(names[0] if len(names) == 1 else names[-1])
-
-    if "lm_head" in lora_module_names:  # needed for 16-bit
-        lora_module_names.remove("lm_head")
-    return list(lora_module_names)
-
-
-def find_retrieval_linear_names(model):
-    cls = torch.nn.Linear
-    lora_module_names = set()
-    multimodal_keywords = ["mm_projector", "vision_tower", "vision_resampler"]
-    for name, module in model.named_modules():
-        if any(mm_keyword in name for mm_keyword in multimodal_keywords):
-            continue
-        if isinstance(module, cls):
-            names = name.split(".")
-            if 'retrieval' in name: 
-                lora_module_names.add(names[0] if len(names) == 1 else names[-1])
-
-    if "lm_head" in lora_module_names:  # needed for 16-bit
-        lora_module_names.remove("lm_head")
-    return list(lora_module_names)
-
-def find_beacon_linear_names(model):
-    cls = torch.nn.Linear
-    lora_module_names = set()
-    multimodal_keywords = ["mm_projector", "vision_tower", "vision_resampler"]
-    for name, module in model.named_modules():
-        if any(mm_keyword in name for mm_keyword in multimodal_keywords):
-            continue
-        if isinstance(module, cls):
-            names = name.split(".")
-            if 'beacon' in name: 
-                lora_module_names.add(names[0] if len(names) == 1 else names[-1])
 
     if "lm_head" in lora_module_names:  # needed for 16-bit
         lora_module_names.remove("lm_head")
@@ -1025,36 +991,18 @@ class LazySupervisedDataset(Dataset):
 
         # Handle multiple JSON files specified in the data_path
         if "{" in data_path and "}" in data_path:
-            if 'jsonl' in data_path:
-                base_path, file_pattern = re.match(r"^(.*)\{(.*)\}\.jsonl$", data_path).groups()
-                file_names = file_pattern.split(",")
-                rank0_print(f"Loading {file_names} from {base_path}")
-                data_args.dataset_paths = []
-                for file_name in file_names:
-                    data_args.dataset_paths.append(f"{base_path}{file_name}.jsonl")
-                    full_path = f"{base_path}{file_name}.jsonl"
-                    rank0_print(f"Loading {full_path}")
-                    this_list_data_dict = []
-                    with open(full_path, "r") as file:
-                        for line in file:
-                            cur_data_dict = json.loads(line)
-                            this_list_data_dict.append(cur_data_dict)
-                    
-                    rank0_print(f"Loaded {len(this_list_data_dict)} samples from {full_path}")
-                    self.list_data_dict.extend(this_list_data_dict)
-            else:
-                base_path, file_pattern = re.match(r"^(.*)\{(.*)\}\.json$", data_path).groups()
-                file_names = file_pattern.split(",")
-                rank0_print(f"Loading {file_names} from {base_path}")
-                data_args.dataset_paths = []
-                for file_name in file_names:
-                    data_args.dataset_paths.append(f"{base_path}{file_name}.json")
-                    full_path = f"{base_path}{file_name}.json"
-                    rank0_print(f"Loading {full_path}")
-                    with open(full_path, "r") as file:
-                        cur_data_dict = json.load(file)
-                        rank0_print(f"Loaded {len(cur_data_dict)} samples from {full_path}")
-                        self.list_data_dict.extend(cur_data_dict)
+            base_path, file_pattern = re.match(r"^(.*)\{(.*)\}\.json$", data_path).groups()
+            file_names = file_pattern.split(",")
+            rank0_print(f"Loading {file_names} from {base_path}")
+            data_args.dataset_paths = []
+            for file_name in file_names:
+                data_args.dataset_paths.append(f"{base_path}{file_name}.json")
+                full_path = f"{base_path}{file_name}.json"
+                rank0_print(f"Loading {full_path}")
+                with open(full_path, "r") as file:
+                    cur_data_dict = json.load(file)
+                    rank0_print(f"Loaded {len(cur_data_dict)} samples from {full_path}")
+                    self.list_data_dict.extend(cur_data_dict)
         elif data_path.endswith(".yaml"):
             with open(data_path, "r") as file:
                 yaml_data = yaml.safe_load(file)
@@ -1501,19 +1449,19 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                         low_cpu_mem_usage=False,
                         **customized_kwargs,
                         )
-                else:   # NOTE: load model from there
-                    # TODO There is need more stable config load method
+                else:
                     model = LlavaQwenForCausalLM.from_pretrained(
-                        model_args.trained_model_name_or_path,
+                        model_args.model_name_or_path,
                         cache_dir=training_args.cache_dir,
                         attn_implementation=training_args.attn_implementation,
                         torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
                         low_cpu_mem_usage=False,
                         reload_enable=model_args.reload_enable,
                         reload_top_k=model_args.reload_top_k,
-                        beacon_ratio = model_args.beacon_ratio
+                        only_lmk_loss=model_args.only_lmk_loss,
+                        **customized_kwargs,
                     )
-
+                    
         elif "gemma" in model_args.model_name_or_path.lower():
             model = LlavaGemmaForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
@@ -1601,7 +1549,7 @@ def train(attn_implementation=None):
 
     if training_args.gradient_checkpointing:
         if hasattr(model, "enable_input_require_grads"):
-            model.enable_input_require_grads() 
+            model.enable_input_require_grads()
         else:
 
             def make_inputs_require_grad(module, input, output):
@@ -1611,20 +1559,15 @@ def train(attn_implementation=None):
 
     if training_args.lora_enable:
         from peft import LoraConfig, get_peft_model
-        # find_all_linear_names will find all of linear layers in the model except ["mm_projector", "vision_tower", "vision_resampler"]
-        # TODO target 只包括 retrieval linear layer
+
         lora_config = LoraConfig(
             r=training_args.lora_r,
             lora_alpha=training_args.lora_alpha,
-            target_modules = find_beacon_linear_names(model),
+            target_modules=find_all_linear_names(model),
             lora_dropout=training_args.lora_dropout,
             bias=training_args.lora_bias,
             task_type="CAUSAL_LM",
         )
-
-        print(f'\n========只微调 retrieval layer=======')
-        print(lora_config)
-
         if training_args.bits == 16:
             if training_args.bf16:
                 model.to(torch.bfloat16)
@@ -1632,6 +1575,8 @@ def train(attn_implementation=None):
                 model.to(torch.float16)
         rank0_print("Adding LoRA adapters...")
         model = get_peft_model(model, lora_config)
+
+    print(f'lora_config: {lora_config}')
 
     if "mistral" in model_args.model_name_or_path.lower() or "mixtral" in model_args.model_name_or_path.lower() or "zephyr" in model_args.model_name_or_path.lower():
         tokenizer = transformers.AutoTokenizer.from_pretrained(model_args.model_name_or_path, cache_dir=training_args.cache_dir, model_max_length=training_args.model_max_length, padding_side="left")
@@ -1672,8 +1617,8 @@ def train(attn_implementation=None):
         else:
             conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1"]
 
-    if model_args.vision_tower is not None: # NOTE: here load mm_projector, vision resampler, 
-        # model.get_model().initialize_vision_modules(model_args=model_args, fsdp=training_args.fsdp)
+    if model_args.vision_tower is not None:
+        model.get_model().initialize_vision_modules(model_args=model_args, fsdp=training_args.fsdp)
 
         vision_tower = model.get_vision_tower()
         vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
@@ -1707,61 +1652,59 @@ def train(attn_implementation=None):
         model.config.tokenizer_padding_side = tokenizer.padding_side
         model.config.tokenizer_model_max_length = tokenizer.model_max_length
 
-        ### NOTE: Deciding train which part of the model
-        # pdb.set_trace() # TODO 改为全部冻结,好像本来就冻结了
+        ### Deciding train which part of the model
+        if model_args.mm_tunable_parts is None:  # traditional way of deciding which part to train
+            model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
+            model.config.tune_mm_vision_resampler = training_args.tune_mm_vision_resampler = model_args.tune_mm_vision_resampler
+            if model_args.tune_mm_mlp_adapter or model_args.tune_mm_vision_resampler:
+                model.requires_grad_(False)
+            if model_args.tune_mm_mlp_adapter:
+                for p in model.get_model().mm_projector.parameters():
+                    p.requires_grad = True
+            if model_args.tune_mm_vision_resampler:
+                for p in model.get_model().vision_resampler.parameters():
+                    p.requires_grad = True
 
-        # if model_args.mm_tunable_parts is None:  # traditional way of deciding which part to train
-        #     model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
-        #     model.config.tune_mm_vision_resampler = training_args.tune_mm_vision_resampler = model_args.tune_mm_vision_resampler
-        #     if model_args.tune_mm_mlp_adapter or model_args.tune_mm_vision_resampler:
-        #         model.requires_grad_(False)
-        #     if model_args.tune_mm_mlp_adapter:
-        #         for p in model.get_model().mm_projector.parameters():
-        #             p.requires_grad = True
-        #     if model_args.tune_mm_vision_resampler:
-        #         for p in model.get_model().vision_resampler.parameters():
-        #             p.requires_grad = True
+            model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
+            if training_args.freeze_mm_mlp_adapter:
+                for p in model.get_model().mm_projector.parameters():
+                    p.requires_grad = False
 
-        #     model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
-        #     if training_args.freeze_mm_mlp_adapter:
-        #         for p in model.get_model().mm_projector.parameters():
-        #             p.requires_grad = False
+            model.config.freeze_mm_vision_resampler = training_args.freeze_mm_vision_resampler
+            if training_args.freeze_mm_vision_resampler:
+                for p in model.get_model().vision_resampler.parameters():
+                    p.requires_grad = False
 
-        #     model.config.freeze_mm_vision_resampler = training_args.freeze_mm_vision_resampler
-        #     if training_args.freeze_mm_vision_resampler:
-        #         for p in model.get_model().vision_resampler.parameters():
-        #             p.requires_grad = False
+            model.config.unfreeze_mm_vision_tower = model_args.unfreeze_mm_vision_tower
+            if model_args.unfreeze_mm_vision_tower:
+                vision_tower.requires_grad_(True)
+            else:
+                vision_tower.requires_grad_(False)
 
-        #     model.config.unfreeze_mm_vision_tower = model_args.unfreeze_mm_vision_tower
-        #     if model_args.unfreeze_mm_vision_tower:
-        #         vision_tower.requires_grad_(True)
-        #     else:
-        #         vision_tower.requires_grad_(False)
-
-        # else:
-        #     rank0_print(f"Using mm_tunable_parts: {model_args.mm_tunable_parts}")
-        #     model.config.mm_tunable_parts = training_args.mm_tunable_parts = model_args.mm_tunable_parts
-        #     # Set the entire model to not require gradients by default
-        #     model.requires_grad_(False)
-        #     vision_tower.requires_grad_(False)
-        #     model.get_model().mm_projector.requires_grad_(False)
-        #     model.get_model().vision_resampler.requires_grad_(False)
-        #     # Parse the mm_tunable_parts to decide which parts to unfreeze
-        #     tunable_parts = model_args.mm_tunable_parts.split(",")
-        #     if "mm_mlp_adapter" in tunable_parts:
-        #         for p in model.get_model().mm_projector.parameters():
-        #             p.requires_grad = True
-        #     if "mm_vision_resampler" in tunable_parts:
-        #         for p in model.get_model().vision_resampler.parameters():
-        #             p.requires_grad = True
-        #     if "mm_vision_tower" in tunable_parts:
-        #         for name, param in model.named_parameters():
-        #             if "vision_tower" in name:
-        #                 param.requires_grad_(True)
-        #     if "mm_language_model" in tunable_parts:
-        #         for name, param in model.named_parameters():
-        #             if "vision_tower" not in name and "mm_projector" not in name and "vision_resampler" not in name:
-        #                 param.requires_grad_(True)
+        else:
+            rank0_print(f"Using mm_tunable_parts: {model_args.mm_tunable_parts}")
+            model.config.mm_tunable_parts = training_args.mm_tunable_parts = model_args.mm_tunable_parts
+            # Set the entire model to not require gradients by default
+            model.requires_grad_(False)
+            vision_tower.requires_grad_(False)
+            model.get_model().mm_projector.requires_grad_(False)
+            model.get_model().vision_resampler.requires_grad_(False)
+            # Parse the mm_tunable_parts to decide which parts to unfreeze
+            tunable_parts = model_args.mm_tunable_parts.split(",")
+            if "mm_mlp_adapter" in tunable_parts:
+                for p in model.get_model().mm_projector.parameters():
+                    p.requires_grad = True
+            if "mm_vision_resampler" in tunable_parts:
+                for p in model.get_model().vision_resampler.parameters():
+                    p.requires_grad = True
+            if "mm_vision_tower" in tunable_parts:
+                for name, param in model.named_parameters():
+                    if "vision_tower" in name:
+                        param.requires_grad_(True)
+            if "mm_language_model" in tunable_parts:
+                for name, param in model.named_parameters():
+                    if "vision_tower" not in name and "mm_projector" not in name and "vision_resampler" not in name:
+                        param.requires_grad_(True)
 
         total_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters())
         trainable_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters() if p.requires_grad)
