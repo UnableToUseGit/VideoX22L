@@ -27,6 +27,7 @@ class Memory(torch.nn.Module):
         reload_enable = False,
         reload_top_k = 3,
         only_lmk_loss = False,
+        only_next_token_loss = False,
     ):
         """Setup necessary attributes."""
         super().__init__()
@@ -52,6 +53,7 @@ class Memory(torch.nn.Module):
 
         self.only_lmk_loss = only_lmk_loss
         print(f'only_lmk_loss: {self.only_lmk_loss}')
+        self.only_next_token_loss = only_next_token_loss
     
     @property
     def beacon_token(self):
@@ -938,6 +940,9 @@ class Memory(torch.nn.Module):
             if self.only_lmk_loss:
                 model_outputs["loss"] = lmk_loss
                 model_outputs["batch_loss"] = lmk_loss
+            elif self.only_next_token_loss:
+                model_outputs["loss"] = model_outputs["loss"]
+                model_outputs["batch_loss"] = model_outputs["batch_loss"]
             else:
                 model_outputs["loss"] = model_outputs["loss"] + lmk_loss
                 model_outputs["batch_loss"] = model_outputs["batch_loss"] + lmk_loss

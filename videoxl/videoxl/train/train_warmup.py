@@ -62,7 +62,8 @@ IS_TOKENIZER_GREATER_THAN_0_14 = version.parse(tokenizers.__version__) >= versio
 class ModelArguments:
     reload_enable: bool = field(default=False)
     reload_top_k: Optional[int] = field(default=3)
-    only_lmk_loss: bool = field(default=False)  # TODO
+    only_lmk_loss: bool = field(default=False)  
+    only_next_token_loss: bool = field(default=False)  
 
     model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
     model_class_name: Optional[str] = field(default=None, metadata={"help": "Used to init model class, format is XXXXForCausalLM. e.g. currently XXXX is chosen from LlavaLlama, LlavaMixtral, LlavaMistral, Llama"})
@@ -1459,6 +1460,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                         reload_enable=model_args.reload_enable,
                         reload_top_k=model_args.reload_top_k,
                         only_lmk_loss=model_args.only_lmk_loss,
+                        only_next_token_loss=model_args.only_next_token_loss,
                         **customized_kwargs,
                     )
                     

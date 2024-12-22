@@ -1932,6 +1932,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         reload_enable = kwargs.pop('reload_enable', False)
         reload_top_k = kwargs.pop('reload_top_k', 3)
         only_lmk_loss = kwargs.pop('only_lmk_loss', False)
+        only_next_token_loss = kwargs.pop('only_next_token_loss', False)
 
         kwargs.update(output_loading_info=True)
         model, loading_info = super().from_pretrained(*args, **kwargs)
