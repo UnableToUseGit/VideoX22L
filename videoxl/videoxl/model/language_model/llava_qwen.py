@@ -427,6 +427,13 @@ class Qwen2Attention(nn.Module):
             self.beacon_o_proj.weight.data.zero_()
             self.beacon_o_proj._is_hf_initialized = True
 
+        if "retrieval_q_proj" in config.beacon_param:
+            # 检索 q proj
+            self.retrieval_q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=self.q_proj.bias is not None)
+            # NOTE: initialize the beacon parameters as zero
+            self.retrieval_q_proj.weight.data.zero_()
+            self.retrieval_q_proj._is_hf_initialized = True
+
     def _init_rope(self):
         if self.config.rope_scaling is None:
             self.rotary_emb = Qwen2RotaryEmbedding(
@@ -526,7 +533,17 @@ class Qwen2Attention(nn.Module):
                         if self.o_proj.bias is not None:
                             self.beacon_o_proj.bias.data[:] = self.o_proj.bias.data
 
-            
+            if "retrieval_q_proj" in beacon_param:
+                params = [self.retrieval_q_proj.weight, self.q_proj.weight]
+                if self.q_proj.bias is not None:
+                    params.extend([self.retrieval_q_proj.bias, self.q_proj.bias])
+                with deepspeed.zero.GatheredParameters(params, modifier_rank=0):
+                    # FIXME: after deepspeed initialization, some weights becomes non-zero, but there are rows that are full of zeros
+                    if (self.retrieval_q_proj.weight.sum(-1) == 0).any() or (self.retrieval_q_proj.weight > 1e29).any():
+                        self.retrieval_q_proj.weight.data[:] = self.q_proj.weight.data
+                        if self.q_proj.bias is not None:
+                            self.retrieval_q_proj.bias.data[:] = self.q_proj.bias.data
+
         else:
 
             # only copy the value in-place, without tieing the weight
@@ -552,6 +569,13 @@ class Qwen2Attention(nn.Module):
                     if self.o_proj.bias is not None:
                         self.beacon_o_proj.bias.data[:] = self.o_proj.bias.data
 
+            # init retrieval_q_proj
+            if "retrieval_q_proj" in beacon_param and any("retrieval_q_proj" in missing_key for missing_key in missing_keys):
+                # FIXME: some beacon weights are not initialized as zero for mistral model, why? 
+                # if (self.beacon_q_proj.weight == 0).all():
+                self.retrieval_q_proj.weight.data[:] = self.q_proj.weight.data
+                if self.q_proj.bias is not None:
+                    self.retrieval_q_proj.bias.data[:] = self.q_proj.bias.data
             
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
@@ -832,7 +856,14 @@ class Qwen2SdpaAttention(Qwen2Attention):
             original_query_states = query_states.clone()
             original_key_states = key_states.clone()
             original_value_states = value_states.clone()
-            query_states_for_retrieval = query_states.clone()[:, :, :memory.query_sep_pos_id_left, :]
+            if hasattr(self, 'retrieval_q_proj'):
+                query_states_for_retrieval = self.retrieval_q_proj(hidden_states)
+                query_states_for_retrieval = query_states_for_retrieval.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+                query_states_for_retrieval = query_states_for_retrieval[:, :, :memory.query_sep_pos_id_left, :]
+            else:
+                query_states_for_retrieval = query_states.clone()[:, :, :memory.query_sep_pos_id_left, :]
+
+
                 
         query_states, key_states = self.rotary_emb(query_states, key_states, position_ids)
 
@@ -855,7 +886,9 @@ class Qwen2SdpaAttention(Qwen2Attention):
         lmk_loss = None
 
         reload_target_layers = [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27]
-        if memory.reload_enable and layer_idx in reload_target_layers and beacon_size == 0 and past_key is not None and q_len != 1:
+        # reload_target_layers = [21,22,23]
+        # reload_target_layers = [10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26]
+        if memory.reload_enable and layer_idx in reload_target_layers and beacon_size == 0 and past_key is not None and q_len != 1 and memory.random_reload_flag:
 
             record_for_print = {
                 'layer_idx':layer_idx,
@@ -903,7 +936,7 @@ class Qwen2SdpaAttention(Qwen2Attention):
                 key_reps_mean_pooling[chunk_idx] = chunk_mean
 
             query_reps_mean_pooling = query_reps_mean_pooling.squeeze(0)
-            key_reps_mean_pooling = key_reps_mean_pooling.squeeze(0)
+            # key_reps_mean_pooling = key_reps_mean_pooling.squeeze(0)
             # key_reps = key_reps.squeeze(0)
             # (q_reps.to(dtype=torch.float32) @ p_reps.transpose(0, 1).to(dtype=torch.float32))/ temperature
             q_reps = torch.nn.functional.normalize(query_reps_mean_pooling, dim=-1)
@@ -911,11 +944,20 @@ class Qwen2SdpaAttention(Qwen2Attention):
             # p_reps = torch.nn.functional.normalize(key_reps, dim=-1)
                 
             # shape: bsz, chunk num
-            scores = self.compute_similarity(q_reps, p_reps) / temperature
+            try:
+                scores = self.compute_similarity(q_reps, p_reps) / temperature
+            except:
+                print(f'scores: {scores}')
+                print(f'q_reps: {q_reps.shape}')
+                print(f'p_reps: {p_reps.shape}')
+                print(f'query_reps_mean_pooling: {query_reps_mean_pooling.shape}')
+                print(f'key_reps_mean_pooling: {key_reps_mean_pooling.shape}')
+                print(f'effective_chunk_infos: {effective_chunk_infos}')
         
             scores_len = scores.size(-1)
 
             loss_target_layers = [3,7,11,13,15,17,19,23,27]
+            # loss_target_layers = [21,22,23]
             if layer_idx in loss_target_layers and ground_truth_pos is not None:
                 ground_truth_pos = list(set(ground_truth_pos))
                 total_pos_num = len(ground_truth_pos)
@@ -927,7 +969,7 @@ class Qwen2SdpaAttention(Qwen2Attention):
             else:
                 lmk_loss = None
             
-            topk_values, topk_indices = torch.topk(scores[:], k=min(memory.reload_top_k, len(scores)))
+            topk_values, topk_indices = torch.topk(scores[:], k=min(memory.reload_top_k, scores_len))
             
             if ground_truth_pos is not None:
                 total_pos_num_for_print = len(ground_truth_pos)
@@ -952,6 +994,7 @@ class Qwen2SdpaAttention(Qwen2Attention):
                 print(f'lmk_loss: {lmk_loss}')
                 print(f'effective_chunk_infos: {effective_chunk_infos}')
                 print(f'loss_target_layers: {loss_target_layers}')
+                print(f'reload_target_layers: {reload_target_layers}')
                 print(f'='*100)
             
             this_layer_offload_activations = memory.offload_activations[layer_idx]
@@ -1933,7 +1976,6 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         reload_top_k = kwargs.pop('reload_top_k', 3)
         only_lmk_loss = kwargs.pop('only_lmk_loss', False)
         only_next_token_loss = kwargs.pop('only_next_token_loss', False)
-
         kwargs.update(output_loading_info=True)
         model, loading_info = super().from_pretrained(*args, **kwargs)
 
@@ -1945,7 +1987,8 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             v_seq_dim=2,
             reload_enable=reload_enable,  
             reload_top_k=reload_top_k,
-            only_lmk_loss=only_lmk_loss
+            only_lmk_loss=only_lmk_loss,
+            only_next_token_loss=only_next_token_loss
         )
         
         missing_keys = loading_info["missing_keys"]
@@ -2064,7 +2107,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
 
         # TODO 推理的时候 保证 ground_truth_pos 为 None，否则 outputs 中会有 loss 这一项，返回回去会报错
         # gt_frame_idx = None
-        if gt_frame_idx is not None: 
+        if gt_frame_idx is not None and gt_frame_idx[0] is not None: 
             if type(gt_frame_idx[0]) == type([]):
                 gt_frame_idx = gt_frame_idx[0]
             ground_truth_pos = []
@@ -2078,16 +2121,16 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         else:
             ground_truth_pos = None
 
-        # print(f"frames_chunks_len: {len(frames_chunks)}, frames_chunks: {frames_chunks}")
-        # print(f"frames_chunks: {frames_chunks}, window: {window_context}")
-        
-        # if random.random() < 0.0001 :
-        #     print(f"beacon_skip_first : {beacon_skip_first}")
-        #     print(f"beacon_skip_last : {beacon_skip_last}")
-        #     print(f"window_context_len: {len(window_context)}, window: {window_context}")
-        #     print(f"frames_chunks_len: {len(frames_chunks)}, frames_chunks: {frames_chunks}")
-        #     print(f"gt_frame_idx_len: {len(gt_frame_idx)}, frames_chunks: {gt_frame_idx}")
-        #     print(f"ground_truth_pos_len: {len(ground_truth_pos)}, ground_truth_pos: {ground_truth_pos}")
+        # 只在训练时启用
+        if self.training:
+            rendom_reload_ratio = random.random()
+            if rendom_reload_ratio <= 0.6:
+                self.memory.random_reload_flag = True
+            else:
+                self.memory.random_reload_flag = False
+        else:
+            self.memory.random_reload_flag = True
+        # self.memory.random_reload_flag = True
 
         # after the first window, one token at a time
         lmk_loss = 0
@@ -2103,24 +2146,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     self.memory.config.beacon_stride = 1440
             self.memory.count+=1
 
-            # rank0_print(self.memory.config.beacon_window)
-            ####################################################
-
             input_ids, attention_mask_all_layers, position_ids_all_layers, past_key_values, labels = self.memory.step()
-            # pdb.set_trace() # tokenzier
-
-            # t4 = time.time()
-            # print("step_input: ",input_ids)
-
-            # if past_key_values[0][0] is not None:
-            #     eval_logger.debug(f"past key states shape: {past_key_values[0][0].shape}")
-            # for idx, position_ids in enumerate(position_ids_all_layers):
-            #     eval_logger.debug(f'layer idx: {idx} position_ids: {position_ids[0][0]} - {position_ids[0][-1]}')
-            #     break
-            # for idx, attn_mask in enumerate(attention_mask_all_layers):
-            #     if attn_mask is not None:
-            #         eval_logger.debug(f'layer idx: {idx} attn_mask.shape: {attn_mask.shape}')
-            #     break
 
             outputs = self._native_forward(
                 input_ids=input_ids,

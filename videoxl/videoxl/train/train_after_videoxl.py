@@ -49,6 +49,7 @@ from videoxl.model import *
 from videoxl.mm_utils import process_highres_image, process_anyres_image, process_highres_image_crop_split, tokenizer_image_token
 from videoxl.utils import rank0_print, process_video_with_pyav, process_video_after_preproecess
 import pdb
+import re
 
 torch.multiprocessing.set_sharing_strategy("file_system")
 
@@ -62,6 +63,10 @@ IS_TOKENIZER_GREATER_THAN_0_14 = version.parse(tokenizers.__version__) >= versio
 class ModelArguments:
     reload_enable: bool = field(default=False)
     reload_top_k: Optional[int] = field(default=3)
+    only_lmk_loss: bool = field(default=False)  
+    only_next_token_loss: bool = field(default=False)  
+
+    ckpt: Optional[str] = field(default=None)
 
     model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
     trained_model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
@@ -303,8 +308,10 @@ def find_all_linear_names(model):
         if any(mm_keyword in name for mm_keyword in multimodal_keywords):
             continue
         if isinstance(module, cls):
-            names = name.split(".")
-            lora_module_names.add(names[0] if len(names) == 1 else names[-1])
+            # names = name.split(".")
+            # lora_module_names.add(names[0] if len(names) == 1 else names[-1])
+            if "lm_head" not in name:
+                lora_module_names.add(name)
 
     if "lm_head" in lora_module_names:  # needed for 16-bit
         lora_module_names.remove("lm_head")
@@ -1023,26 +1030,9 @@ class LazySupervisedDataset(Dataset):
         self.tokenizer = tokenizer
         self.list_data_dict = []
 
-        # Handle multiple JSON files specified in the data_path
-        if "{" in data_path and "}" in data_path:
-            if 'jsonl' in data_path:
-                base_path, file_pattern = re.match(r"^(.*)\{(.*)\}\.jsonl$", data_path).groups()
-                file_names = file_pattern.split(",")
-                rank0_print(f"Loading {file_names} from {base_path}")
-                data_args.dataset_paths = []
-                for file_name in file_names:
-                    data_args.dataset_paths.append(f"{base_path}{file_name}.jsonl")
-                    full_path = f"{base_path}{file_name}.jsonl"
-                    rank0_print(f"Loading {full_path}")
-                    this_list_data_dict = []
-                    with open(full_path, "r") as file:
-                        for line in file:
-                            cur_data_dict = json.loads(line)
-                            this_list_data_dict.append(cur_data_dict)
-                    
-                    rank0_print(f"Loaded {len(this_list_data_dict)} samples from {full_path}")
-                    self.list_data_dict.extend(this_list_data_dict)
-            else:
+        if '%' in data_path:
+            data_paths = data_path.split('%')
+            for data_path in data_paths:
                 base_path, file_pattern = re.match(r"^(.*)\{(.*)\}\.json$", data_path).groups()
                 file_names = file_pattern.split(",")
                 rank0_print(f"Loading {file_names} from {base_path}")
@@ -1055,53 +1045,69 @@ class LazySupervisedDataset(Dataset):
                         cur_data_dict = json.load(file)
                         rank0_print(f"Loaded {len(cur_data_dict)} samples from {full_path}")
                         self.list_data_dict.extend(cur_data_dict)
-        elif data_path.endswith(".yaml"):
-            with open(data_path, "r") as file:
-                yaml_data = yaml.safe_load(file)
-                datasets = yaml_data.get("datasets")
-                # file should be in the format of:
-                # datasets:
-                #   - json_path: xxxx1.json
-                #     sampling_strategy: first:1000
-                #   - json_path: xxxx2.json
-                #     sampling_strategy: end:3000
-                #   - json_path: xxxx3.json
-                #     sampling_strategy: random:999
-                data_args.dataset_paths = [dataset.get("json_path") for dataset in datasets]
-                for dataset in datasets:
-                    json_path = dataset.get("json_path")
-                    sampling_strategy = dataset.get("sampling_strategy", "all")
-                    sampling_number = None
-
-                    rank0_print(f"Loading {json_path} with {sampling_strategy} sampling strategy")
-                    with open(json_path, "r") as json_file:
-                        cur_data_dict = json.load(json_file)
-
-                    if ":" in sampling_strategy:
-                        sampling_strategy, sampling_number = sampling_strategy.split(":")
-                        if "%" in sampling_number:
-                            sampling_number = math.ceil(int(sampling_number.split("%")[0]) * len(cur_data_dict) / 100)
-                        else:
-                            sampling_number = int(sampling_number)
-
-                    # Apply the sampling strategy
-                    if sampling_strategy == "first" and sampling_number is not None:
-                        cur_data_dict = cur_data_dict[:sampling_number]
-                    elif sampling_strategy == "end" and sampling_number is not None:
-                        cur_data_dict = cur_data_dict[-sampling_number:]
-                    elif sampling_strategy == "random" and sampling_number is not None:
-                        random.shuffle(cur_data_dict)
-                        cur_data_dict = cur_data_dict[:sampling_number]
-
-                    rank0_print(f"Loaded {len(cur_data_dict)} samples from {json_path}")
-                    self.list_data_dict.extend(cur_data_dict)
+        
         else:
-            data_args.dataset_paths = [data_path]
-            rank0_print(f"Loading {data_path}")
-            with open(data_path, "r") as file:
-                cur_data_dict = json.load(file)
-                rank0_print(f"Loaded {len(cur_data_dict)} samples from {data_path}")
-                self.list_data_dict.extend(cur_data_dict)
+            # Handle multiple JSON files specified in the data_path
+            if "{" in data_path and "}" in data_path:
+                base_path, file_pattern = re.match(r"^(.*)\{(.*)\}\.json$", data_path).groups()
+                file_names = file_pattern.split(",")
+                rank0_print(f"Loading {file_names} from {base_path}")
+                data_args.dataset_paths = []
+                for file_name in file_names:
+                    data_args.dataset_paths.append(f"{base_path}{file_name}.json")
+                    full_path = f"{base_path}{file_name}.json"
+                    rank0_print(f"Loading {full_path}")
+                    with open(full_path, "r") as file:
+                        cur_data_dict = json.load(file)
+                        rank0_print(f"Loaded {len(cur_data_dict)} samples from {full_path}")
+                        self.list_data_dict.extend(cur_data_dict)
+            elif data_path.endswith(".yaml"):
+                with open(data_path, "r") as file:
+                    yaml_data = yaml.safe_load(file)
+                    datasets = yaml_data.get("datasets")
+                    # file should be in the format of:
+                    # datasets:
+                    #   - json_path: xxxx1.json
+                    #     sampling_strategy: first:1000
+                    #   - json_path: xxxx2.json
+                    #     sampling_strategy: end:3000
+                    #   - json_path: xxxx3.json
+                    #     sampling_strategy: random:999
+                    data_args.dataset_paths = [dataset.get("json_path") for dataset in datasets]
+                    for dataset in datasets:
+                        json_path = dataset.get("json_path")
+                        sampling_strategy = dataset.get("sampling_strategy", "all")
+                        sampling_number = None
+
+                        rank0_print(f"Loading {json_path} with {sampling_strategy} sampling strategy")
+                        with open(json_path, "r") as json_file:
+                            cur_data_dict = json.load(json_file)
+
+                        if ":" in sampling_strategy:
+                            sampling_strategy, sampling_number = sampling_strategy.split(":")
+                            if "%" in sampling_number:
+                                sampling_number = math.ceil(int(sampling_number.split("%")[0]) * len(cur_data_dict) / 100)
+                            else:
+                                sampling_number = int(sampling_number)
+
+                        # Apply the sampling strategy
+                        if sampling_strategy == "first" and sampling_number is not None:
+                            cur_data_dict = cur_data_dict[:sampling_number]
+                        elif sampling_strategy == "end" and sampling_number is not None:
+                            cur_data_dict = cur_data_dict[-sampling_number:]
+                        elif sampling_strategy == "random" and sampling_number is not None:
+                            random.shuffle(cur_data_dict)
+                            cur_data_dict = cur_data_dict[:sampling_number]
+
+                        rank0_print(f"Loaded {len(cur_data_dict)} samples from {json_path}")
+                        self.list_data_dict.extend(cur_data_dict)
+            else:
+                data_args.dataset_paths = [data_path]
+                rank0_print(f"Loading {data_path}")
+                with open(data_path, "r") as file:
+                    cur_data_dict = json.load(file)
+                    rank0_print(f"Loaded {len(cur_data_dict)} samples from {data_path}")
+                    self.list_data_dict.extend(cur_data_dict)
 
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
@@ -1226,9 +1232,9 @@ class LazySupervisedDataset(Dataset):
             print(f'image:{image}')
 
         elif "video" in sources[0]:
-            video_file = self.list_data_dict[i]["video"]
+            video_file_from_list_data_dict = self.list_data_dict[i]["video"]
             video_folder = self.data_args.video_folder  # TODO 对于自定义数据来说，video_folder 似乎可以没有
-            video_file = os.path.join(video_folder, video_file)
+            video_file = os.path.join(video_folder, video_file_from_list_data_dict) # 如果video_file_from_list_data_dict是绝对路径，os.path.join会忽略前边的 video_folder
             suffix = video_file.split(".")[-1]
             if not os.path.exists(video_file):
                 print("File {} not exist!".format(video_file))
@@ -1427,6 +1433,9 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
             setattr(cfg_pretrained, k, v)
 
         customized_kwargs["config"] = cfg_pretrained
+    
+    # my_customized_kwargs = {}
+    # my_customized_kwargs["config"] = overwrite_config
 
     if model_args.model_class_name is not None:
         actual_model_class_name = f"{model_args.model_class_name}ForCausalLM"
@@ -1511,7 +1520,9 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                         low_cpu_mem_usage=False,
                         reload_enable=model_args.reload_enable,
                         reload_top_k=model_args.reload_top_k,
-                        beacon_ratio = model_args.beacon_ratio
+                        only_lmk_loss=model_args.only_lmk_loss,
+                        only_next_token_loss=model_args.only_next_token_loss,
+                        **overwrite_config
                     )
 
         elif "gemma" in model_args.model_name_or_path.lower():
@@ -1538,6 +1549,26 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
     return model
 
 
+
+def get_last_checkpoint(folder):
+    PREFIX_CHECKPOINT_DIR = "checkpoint"
+    _re_checkpoint = re.compile(r"^" + PREFIX_CHECKPOINT_DIR + r"\-(\d+)$")
+    content = os.listdir(folder)
+    checkpoints = [
+        path
+        for path in content
+        if _re_checkpoint.search(path) is not None and os.path.isdir(os.path.join(folder, path))
+    ]
+    if len(checkpoints) == 0:
+        return
+    return os.path.join(folder, max(checkpoints, key=lambda x: int(_re_checkpoint.search(x).groups()[0])))
+
+
+def pp(model):
+    total_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters())
+    trainable_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters() if p.requires_grad)
+    rank0_print(f"Total parameters: ~{total_params/1e6:.2f} MB)")
+    rank0_print(f"Trainable parameters: ~{trainable_params/1e6:.2f} MB)")
 
 def train(attn_implementation=None):
     global local_rank
@@ -1601,7 +1632,7 @@ def train(attn_implementation=None):
 
     if training_args.gradient_checkpointing:
         if hasattr(model, "enable_input_require_grads"):
-            model.enable_input_require_grads() 
+            model.enable_input_require_grads()
         else:
 
             def make_inputs_require_grad(module, input, output):
@@ -1613,17 +1644,16 @@ def train(attn_implementation=None):
         from peft import LoraConfig, get_peft_model
         # find_all_linear_names will find all of linear layers in the model except ["mm_projector", "vision_tower", "vision_resampler"]
         # TODO target 只包括 retrieval linear layer
+
+        target_modules = find_all_linear_names(model)
         lora_config = LoraConfig(
             r=training_args.lora_r,
             lora_alpha=training_args.lora_alpha,
-            target_modules = find_beacon_linear_names(model),
+            target_modules = target_modules,
             lora_dropout=training_args.lora_dropout,
             bias=training_args.lora_bias,
             task_type="CAUSAL_LM",
         )
-
-        print(f'\n========只微调 retrieval layer=======')
-        print(lora_config)
 
         if training_args.bits == 16:
             if training_args.bf16:
@@ -1633,6 +1663,8 @@ def train(attn_implementation=None):
         rank0_print("Adding LoRA adapters...")
         model = get_peft_model(model, lora_config)
 
+    print(f'lora_config: {lora_config}')
+    
     if "mistral" in model_args.model_name_or_path.lower() or "mixtral" in model_args.model_name_or_path.lower() or "zephyr" in model_args.model_name_or_path.lower():
         tokenizer = transformers.AutoTokenizer.from_pretrained(model_args.model_name_or_path, cache_dir=training_args.cache_dir, model_max_length=training_args.model_max_length, padding_side="left")
     elif "qwen" in model_args.model_name_or_path.lower():
@@ -1677,7 +1709,6 @@ def train(attn_implementation=None):
 
         vision_tower = model.get_vision_tower()
         vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
-
         data_args.image_processor = vision_tower.image_processor
         data_args.is_multimodal = True
 
@@ -1707,66 +1738,65 @@ def train(attn_implementation=None):
         model.config.tokenizer_padding_side = tokenizer.padding_side
         model.config.tokenizer_model_max_length = tokenizer.model_max_length
 
-        ### NOTE: Deciding train which part of the model
-        # pdb.set_trace() # TODO 改为全部冻结,好像本来就冻结了
+        ### NOTE: Deciding train which part of the model 
+        if model_args.mm_tunable_parts is None:  # traditional way of deciding which part to train
+            model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
+            model.config.tune_mm_vision_resampler = training_args.tune_mm_vision_resampler = model_args.tune_mm_vision_resampler
+            # if model_args.tune_mm_mlp_adapter or model_args.tune_mm_vision_resampler:
+            #     model.requires_grad_(False)
+            if model_args.tune_mm_mlp_adapter:
+                for p in model.get_model().mm_projector.parameters():
+                    p.requires_grad = True
+            if model_args.tune_mm_vision_resampler:
+                for p in model.get_model().vision_resampler.parameters():
+                    p.requires_grad = True
 
-        # if model_args.mm_tunable_parts is None:  # traditional way of deciding which part to train
-        #     model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
-        #     model.config.tune_mm_vision_resampler = training_args.tune_mm_vision_resampler = model_args.tune_mm_vision_resampler
-        #     if model_args.tune_mm_mlp_adapter or model_args.tune_mm_vision_resampler:
-        #         model.requires_grad_(False)
-        #     if model_args.tune_mm_mlp_adapter:
-        #         for p in model.get_model().mm_projector.parameters():
-        #             p.requires_grad = True
-        #     if model_args.tune_mm_vision_resampler:
-        #         for p in model.get_model().vision_resampler.parameters():
-        #             p.requires_grad = True
+            model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
+            if training_args.freeze_mm_mlp_adapter:
+                for p in model.get_model().mm_projector.parameters():
+                    p.requires_grad = False
 
-        #     model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
-        #     if training_args.freeze_mm_mlp_adapter:
-        #         for p in model.get_model().mm_projector.parameters():
-        #             p.requires_grad = False
+            model.config.freeze_mm_vision_resampler = training_args.freeze_mm_vision_resampler
+            if training_args.freeze_mm_vision_resampler:
+                for p in model.get_model().vision_resampler.parameters():
+                    p.requires_grad = False
 
-        #     model.config.freeze_mm_vision_resampler = training_args.freeze_mm_vision_resampler
-        #     if training_args.freeze_mm_vision_resampler:
-        #         for p in model.get_model().vision_resampler.parameters():
-        #             p.requires_grad = False
+            model.config.unfreeze_mm_vision_tower = model_args.unfreeze_mm_vision_tower
+            if model_args.unfreeze_mm_vision_tower:
+                vision_tower.requires_grad_(True)
+            else:
+                vision_tower.requires_grad_(False)
 
-        #     model.config.unfreeze_mm_vision_tower = model_args.unfreeze_mm_vision_tower
-        #     if model_args.unfreeze_mm_vision_tower:
-        #         vision_tower.requires_grad_(True)
-        #     else:
-        #         vision_tower.requires_grad_(False)
-
-        # else:
-        #     rank0_print(f"Using mm_tunable_parts: {model_args.mm_tunable_parts}")
-        #     model.config.mm_tunable_parts = training_args.mm_tunable_parts = model_args.mm_tunable_parts
-        #     # Set the entire model to not require gradients by default
-        #     model.requires_grad_(False)
-        #     vision_tower.requires_grad_(False)
-        #     model.get_model().mm_projector.requires_grad_(False)
-        #     model.get_model().vision_resampler.requires_grad_(False)
-        #     # Parse the mm_tunable_parts to decide which parts to unfreeze
-        #     tunable_parts = model_args.mm_tunable_parts.split(",")
-        #     if "mm_mlp_adapter" in tunable_parts:
-        #         for p in model.get_model().mm_projector.parameters():
-        #             p.requires_grad = True
-        #     if "mm_vision_resampler" in tunable_parts:
-        #         for p in model.get_model().vision_resampler.parameters():
-        #             p.requires_grad = True
-        #     if "mm_vision_tower" in tunable_parts:
-        #         for name, param in model.named_parameters():
-        #             if "vision_tower" in name:
-        #                 param.requires_grad_(True)
-        #     if "mm_language_model" in tunable_parts:
-        #         for name, param in model.named_parameters():
-        #             if "vision_tower" not in name and "mm_projector" not in name and "vision_resampler" not in name:
-        #                 param.requires_grad_(True)
+        else:
+            rank0_print(f"Using mm_tunable_parts: {model_args.mm_tunable_parts}")
+            model.config.mm_tunable_parts = training_args.mm_tunable_parts = model_args.mm_tunable_parts
+            # Set the entire model to not require gradients by default
+            model.requires_grad_(False)
+            vision_tower.requires_grad_(False)
+            model.get_model().mm_projector.requires_grad_(False)
+            model.get_model().vision_resampler.requires_grad_(False)
+            # Parse the mm_tunable_parts to decide which parts to unfreeze
+            tunable_parts = model_args.mm_tunable_parts.split(",")
+            if "mm_mlp_adapter" in tunable_parts:
+                for p in model.get_model().mm_projector.parameters():
+                    p.requires_grad = True
+            if "mm_vision_resampler" in tunable_parts:
+                for p in model.get_model().vision_resampler.parameters():
+                    p.requires_grad = True
+            if "mm_vision_tower" in tunable_parts:
+                for name, param in model.named_parameters():
+                    if "vision_tower" in name:
+                        param.requires_grad_(True)
+            if "mm_language_model" in tunable_parts:
+                for name, param in model.named_parameters():
+                    if "vision_tower" not in name and "mm_projector" not in name and "vision_resampler" not in name:
+                        param.requires_grad_(True)
 
         total_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters())
         trainable_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters() if p.requires_grad)
         rank0_print(f"Total parameters: ~{total_params/1e6:.2f} MB)")
         rank0_print(f"Trainable parameters: ~{trainable_params/1e6:.2f} MB)")
+
         if training_args.bits in [4, 8]:
             model.get_model().mm_projector.to(dtype=compute_dtype, device=training_args.device)
 
@@ -1776,7 +1806,7 @@ def train(attn_implementation=None):
         training_args.use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
         model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
-
+    
     if training_args.bits in [4, 8]:
         from peft.tuners.lora import LoraLayer
 
@@ -1804,9 +1834,55 @@ def train(attn_implementation=None):
             model_args=model_args,
             **data_module
         )
- 
+
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
+        print(f'resume training!')
+        # TODO 先提前 load no_lora_module weight
+        last_ckpt_dir = get_last_checkpoint(training_args.output_dir)
+        print(f'last_ckpt_dir: {last_ckpt_dir}')
+        non_lora_trainables_state_dict_path = os.path.join(last_ckpt_dir, "non_lora_trainables.bin")
+        # 载入 vision tower 权重
+        non_lora_trainables_state_dict = torch.load(non_lora_trainables_state_dict_path)
+
+        for name, param in model.get_vision_tower().named_parameters():
+            try:
+                mapping_name = 'base_model.model.model.vision_tower.' + name
+                new_val = non_lora_trainables_state_dict[mapping_name]
+            except:
+                mapping_name = 'module.base_model.model.model.vision_tower.' + name
+                new_val = non_lora_trainables_state_dict[mapping_name]
+
+            # new_val 的设备，数据类型， required_grad 和 原本的 param 一致
+            if new_val.device != param.device:
+                new_val = new_val.to(param.device)
+            # if new_val.dtype != param.dtype:
+            #     new_val = new_val.to(param.dtype)
+            if new_val.requires_grad != param.requires_grad:
+                new_val.requires_grad = param.requires_grad
+
+            param.data.copy_(new_val)
+    
+        for name, param in model.get_model().mm_projector.named_parameters():
+            try:
+                mapping_name = 'base_model.model.model.mm_projector.' + name
+                new_val = non_lora_trainables_state_dict[mapping_name] # non_lora_trainables_state_dict['base_model.model.model.mm_projector.' + name]
+            except:
+                mapping_name = 'module.base_model.model.model.mm_projector.' + name
+                new_val = non_lora_trainables_state_dict[mapping_name]
+
+            # new_val 的设备，数据类型， required_grad 和 原本的 param 一致
+            if new_val.device != param.device:
+                new_val = new_val.to(param.device)
+            # if new_val.dtype != param.dtype:
+            #     new_val = new_val.to(param.dtype)
+            if new_val.requires_grad != param.requires_grad:
+                new_val.requires_grad = param.requires_grad
+
+            param.data.copy_(new_val)
+
+        print(model)
+
         trainer.train(resume_from_checkpoint=True)
     else:
         trainer.train()

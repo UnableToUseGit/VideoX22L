@@ -47,7 +47,7 @@ from videoxl.train.pretrain_llava_trainer import Pre_LLaVATrainer
 from videoxl import conversation as conversation_lib
 from videoxl.model import *
 from videoxl.mm_utils import process_highres_image, process_anyres_image, process_highres_image_crop_split, tokenizer_image_token
-from videoxl.utils import rank0_print, process_video_with_pyav
+from videoxl.utils import rank0_print, process_video_with_pyav, process_video_after_preproecess
 import pdb
 
 torch.multiprocessing.set_sharing_strategy("file_system")
@@ -935,6 +935,7 @@ def preprocess(sources: Sequence[str], tokenizer: transformers.PreTrainedTokeniz
     3. Tokenize the concatenated conversation;
     4. Make a deepcopy as the target. Mask human words with IGNORE_INDEX.
     """
+
     if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.PLAIN:
         return preprocess_plain(sources, tokenizer)
     if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.LLAMA_2:
@@ -974,7 +975,7 @@ def preprocess(sources: Sequence[str], tokenizer: transformers.PreTrainedTokeniz
             tokenized_lens = _tokenize_fn([header] + [s["value"] for s in source], tokenizer)["input_ids_lens"]
         speakers = [sentence["from"] for sentence in source]
         _mask_targets(target, tokenized_lens, speakers)
-
+    
     return dict(input_ids=input_ids, labels=targets)
 
 
@@ -984,67 +985,84 @@ class LazySupervisedDataset(Dataset):
         self.tokenizer = tokenizer
         self.list_data_dict = []
 
-        # Handle multiple JSON files specified in the data_path
-        if "{" in data_path and "}" in data_path:
-            base_path, file_pattern = re.match(r"^(.*)\{(.*)\}\.json$", data_path).groups()
-            file_names = file_pattern.split(",")
-            rank0_print(f"Loading {file_names} from {base_path}")
-            data_args.dataset_paths = []
-            for file_name in file_names:
-                data_args.dataset_paths.append(f"{base_path}{file_name}.json")
-                full_path = f"{base_path}{file_name}.json"
-                rank0_print(f"Loading {full_path}")
-                with open(full_path, "r") as file:
-                    cur_data_dict = json.load(file)
-                    rank0_print(f"Loaded {len(cur_data_dict)} samples from {full_path}")
-                    self.list_data_dict.extend(cur_data_dict)
-        elif data_path.endswith(".yaml"):
-            with open(data_path, "r") as file:
-                yaml_data = yaml.safe_load(file)
-                datasets = yaml_data.get("datasets")
-                # file should be in the format of:
-                # datasets:
-                #   - json_path: xxxx1.json
-                #     sampling_strategy: first:1000
-                #   - json_path: xxxx2.json
-                #     sampling_strategy: end:3000
-                #   - json_path: xxxx3.json
-                #     sampling_strategy: random:999
-                data_args.dataset_paths = [dataset.get("json_path") for dataset in datasets]
-                for dataset in datasets:
-                    json_path = dataset.get("json_path")
-                    sampling_strategy = dataset.get("sampling_strategy", "all")
-                    sampling_number = None
-
-                    rank0_print(f"Loading {json_path} with {sampling_strategy} sampling strategy")
-                    with open(json_path, "r") as json_file:
-                        cur_data_dict = json.load(json_file)
-
-                    if ":" in sampling_strategy:
-                        sampling_strategy, sampling_number = sampling_strategy.split(":")
-                        if "%" in sampling_number:
-                            sampling_number = math.ceil(int(sampling_number.split("%")[0]) * len(cur_data_dict) / 100)
-                        else:
-                            sampling_number = int(sampling_number)
-
-                    # Apply the sampling strategy
-                    if sampling_strategy == "first" and sampling_number is not None:
-                        cur_data_dict = cur_data_dict[:sampling_number]
-                    elif sampling_strategy == "end" and sampling_number is not None:
-                        cur_data_dict = cur_data_dict[-sampling_number:]
-                    elif sampling_strategy == "random" and sampling_number is not None:
-                        random.shuffle(cur_data_dict)
-                        cur_data_dict = cur_data_dict[:sampling_number]
-
-                    rank0_print(f"Loaded {len(cur_data_dict)} samples from {json_path}")
-                    self.list_data_dict.extend(cur_data_dict)
+        if '%' in data_path:
+            data_paths = data_path.split('%')
+            for data_path in data_paths:
+                base_path, file_pattern = re.match(r"^(.*)\{(.*)\}\.json$", data_path).groups()
+                file_names = file_pattern.split(",")
+                rank0_print(f"Loading {file_names} from {base_path}")
+                data_args.dataset_paths = []
+                for file_name in file_names:
+                    data_args.dataset_paths.append(f"{base_path}{file_name}.json")
+                    full_path = f"{base_path}{file_name}.json"
+                    rank0_print(f"Loading {full_path}")
+                    with open(full_path, "r") as file:
+                        cur_data_dict = json.load(file)
+                        rank0_print(f"Loaded {len(cur_data_dict)} samples from {full_path}")
+                        self.list_data_dict.extend(cur_data_dict)
+        
         else:
-            data_args.dataset_paths = [data_path]
-            rank0_print(f"Loading {data_path}")
-            with open(data_path, "r") as file:
-                cur_data_dict = json.load(file)
-                rank0_print(f"Loaded {len(cur_data_dict)} samples from {data_path}")
-                self.list_data_dict.extend(cur_data_dict)
+            # Handle multiple JSON files specified in the data_path
+            if "{" in data_path and "}" in data_path:
+                base_path, file_pattern = re.match(r"^(.*)\{(.*)\}\.json$", data_path).groups()
+                file_names = file_pattern.split(",")
+                rank0_print(f"Loading {file_names} from {base_path}")
+                data_args.dataset_paths = []
+                for file_name in file_names:
+                    data_args.dataset_paths.append(f"{base_path}{file_name}.json")
+                    full_path = f"{base_path}{file_name}.json"
+                    rank0_print(f"Loading {full_path}")
+                    with open(full_path, "r") as file:
+                        cur_data_dict = json.load(file)
+                        rank0_print(f"Loaded {len(cur_data_dict)} samples from {full_path}")
+                        self.list_data_dict.extend(cur_data_dict)
+            elif data_path.endswith(".yaml"):
+                with open(data_path, "r") as file:
+                    yaml_data = yaml.safe_load(file)
+                    datasets = yaml_data.get("datasets")
+                    # file should be in the format of:
+                    # datasets:
+                    #   - json_path: xxxx1.json
+                    #     sampling_strategy: first:1000
+                    #   - json_path: xxxx2.json
+                    #     sampling_strategy: end:3000
+                    #   - json_path: xxxx3.json
+                    #     sampling_strategy: random:999
+                    data_args.dataset_paths = [dataset.get("json_path") for dataset in datasets]
+                    for dataset in datasets:
+                        json_path = dataset.get("json_path")
+                        sampling_strategy = dataset.get("sampling_strategy", "all")
+                        sampling_number = None
+
+                        rank0_print(f"Loading {json_path} with {sampling_strategy} sampling strategy")
+                        with open(json_path, "r") as json_file:
+                            cur_data_dict = json.load(json_file)
+
+                        if ":" in sampling_strategy:
+                            sampling_strategy, sampling_number = sampling_strategy.split(":")
+                            if "%" in sampling_number:
+                                sampling_number = math.ceil(int(sampling_number.split("%")[0]) * len(cur_data_dict) / 100)
+                            else:
+                                sampling_number = int(sampling_number)
+
+                        # Apply the sampling strategy
+                        if sampling_strategy == "first" and sampling_number is not None:
+                            cur_data_dict = cur_data_dict[:sampling_number]
+                        elif sampling_strategy == "end" and sampling_number is not None:
+                            cur_data_dict = cur_data_dict[-sampling_number:]
+                        elif sampling_strategy == "random" and sampling_number is not None:
+                            random.shuffle(cur_data_dict)
+                            cur_data_dict = cur_data_dict[:sampling_number]
+
+                        rank0_print(f"Loaded {len(cur_data_dict)} samples from {json_path}")
+                        self.list_data_dict.extend(cur_data_dict)
+            else:
+                data_args.dataset_paths = [data_path]
+                rank0_print(f"Loading {data_path}")
+                with open(data_path, "r") as file:
+                    cur_data_dict = json.load(file)
+                    rank0_print(f"Loaded {len(cur_data_dict)} samples from {data_path}")
+                    self.list_data_dict.extend(cur_data_dict)
 
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
@@ -1175,40 +1193,20 @@ class LazySupervisedDataset(Dataset):
                 print("File {} not exist!".format(video_file))
 
             try:
-                video, _ = process_video_with_pyav(video_file, self.data_args)
-                # using videoreader
-                # if "shareVideoGPTV" not in video_file and "liangke" not in video_file:
-                # vr = VideoReader(video_file, ctx=cpu(0))
-                # total_frame_num = len(vr)
-                # avg_fps = round(vr.get_avg_fps() / self.data_args.video_fps)
-                # frame_idx = [i for i in range(0, total_frame_num, avg_fps)]
-                # if self.data_args.frames_upbound > 0:
-                #     if len(frame_idx) > self.data_args.frames_upbound:
-                #         uniform_sampled_frames = np.linspace(0, total_frame_num - 1, self.data_args.frames_upbound, dtype=int)
-                #         frame_idx = uniform_sampled_frames.tolist()
-                # video = vr.get_batch(frame_idx).asnumpy()
-                # video = np.array(video)
-                # else:
-                #     if "liangke" in video_file:
-                #         video_file = self.list_data_dict[i]["video"]
-                #     frame_files = [os.path.join(video_file, f) for f in os.listdir(video_file) if os.path.isfile(os.path.join(video_file, f))]
-                #     frame_files.sort()  # Ensure the frames are sorted if they are named sequentially
-
-                #     # TODO: Hard CODE: Determine the indices for uniformly sampling 10 frames
-                #     num_frames_to_sample = 10
-                #     total_frames = len(frame_files)
-                #     sampled_indices = np.linspace(0, total_frames - 1, num_frames_to_sample, dtype=int)
-
-                #     # Read and store the sampled frames
-                #     video = []
-                #     for idx in sampled_indices:
-                #         frame_path = frame_files[idx]
-                #         try:
-                #             with Image.open(frame_path) as img:
-                #                 frame = img.convert("RGB")
-                #                 video.append(frame)
-                #         except IOError:
-                #             print(f"Failed to read frame at path: {frame_path}")
+                if os.path.isdir(video_file):   # 说明是 增广数据 activityQA sharegpt4video
+                    video = process_video_after_preproecess(video_file)
+                    gt_frame_idx = self.list_data_dict[i]["gt_frame_idx"]
+                    # print(f'video.shape: {video.shape}')
+                    # print(f'gt_frame_idx: {gt_frame_idx}')
+                else:
+                    # print(f'\n========加载当前数据=======')
+                    # print(f'sources:{sources}')
+                    if 'gt_time_span' in self.list_data_dict[i]:
+                        gt_time_span = self.list_data_dict[i]["gt_time_span"] # [[]..]
+                    else:
+                        gt_time_span = None
+                    # TODO
+                    video, gt_frame_idx = process_video_with_pyav(video_file, self.data_args, gt_time_span=gt_time_span)
 
                 processor = self.data_args.image_processor
                 image = processor.preprocess(video, return_tensors="pt")["pixel_values"]
@@ -1222,7 +1220,7 @@ class LazySupervisedDataset(Dataset):
             sources = copy.deepcopy([e["conversations"] for e in sources])
 
         has_image = ("image" in self.list_data_dict[i]) or ("video" in self.list_data_dict[i])
-        data_dict = preprocess(sources, self.tokenizer, has_image=has_image)
+        data_dict = preprocess(sources, self.tokenizer, has_image=has_image)    # get input_ids and labels
 
         if "prompt" in data_dict:
             prompt = data_dict["prompt"]
@@ -1246,6 +1244,9 @@ class LazySupervisedDataset(Dataset):
         # prompt exist in the data
         if prompt is not None:
             data_dict["prompt"] = prompt
+
+        if len(gt_frame_idx) > 0:
+            data_dict["gt_frame_idx"] = gt_frame_idx
 
         data_dict["id"] = self.list_data_dict[i].get("id", i)
 
@@ -1295,6 +1296,13 @@ class DataCollatorForSupervisedDataset(object):
 
         if "prompt" in instances[0]:
             batch["prompts"] = [instance["prompt"] for instance in instances]
+
+        batch["gt_frame_idx"] = []
+        for inst in instances:
+            if "gt_frame_idx" in inst:
+                batch["gt_frame_idx"].append(inst["gt_frame_idx"])
+            else:
+                batch["gt_frame_idx"].append(None)   
 
         return batch
 

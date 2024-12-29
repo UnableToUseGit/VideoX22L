@@ -49,6 +49,7 @@ from videoxl.model import *
 from videoxl.mm_utils import process_highres_image, process_anyres_image, process_highres_image_crop_split, tokenizer_image_token
 from videoxl.utils import rank0_print, process_video_with_pyav, process_video_after_preproecess
 import pdb
+import re
 
 torch.multiprocessing.set_sharing_strategy("file_system")
 
@@ -1330,6 +1331,10 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
     ):
         cfg_pretrained = AutoConfig.from_pretrained(model_args.model_name_or_path)
 
+    # 这个地方很阴险
+    overwrite_config["architectures"] = "LlavaQwenForCausalLM"
+    # overwrite_config["model_type"] = "llava_qwen"
+
     overwrite_config["beacon_window"] = model_args.beacon_window
     overwrite_config["beacon_stride"] = model_args.beacon_stride
     overwrite_config["beacon_attn"] = model_args.beacon_attn
@@ -1464,6 +1469,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                         **customized_kwargs,
                     )
                     
+                    
         elif "gemma" in model_args.model_name_or_path.lower():
             model = LlavaGemmaForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
@@ -1487,7 +1493,18 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
 
     return model
 
-
+def get_last_checkpoint(folder):
+    PREFIX_CHECKPOINT_DIR = "checkpoint"
+    _re_checkpoint = re.compile(r"^" + PREFIX_CHECKPOINT_DIR + r"\-(\d+)$")
+    content = os.listdir(folder)
+    checkpoints = [
+        path
+        for path in content
+        if _re_checkpoint.search(path) is not None and os.path.isdir(os.path.join(folder, path))
+    ]
+    if len(checkpoints) == 0:
+        return
+    return os.path.join(folder, max(checkpoints, key=lambda x: int(_re_checkpoint.search(x).groups()[0])))
 
 def train(attn_implementation=None):
     global local_rank
@@ -1562,10 +1579,13 @@ def train(attn_implementation=None):
     if training_args.lora_enable:
         from peft import LoraConfig, get_peft_model
 
+        # TODO adjust
+        target_modules = ["q_proj", "beacon_q_proj", "beacon_k_proj", "beacon_v_proj", "beacon_o_proj"]
+
         lora_config = LoraConfig(
             r=training_args.lora_r,
             lora_alpha=training_args.lora_alpha,
-            target_modules=find_all_linear_names(model),
+            target_modules=find_all_linear_names(model), # , ["beacon_q_proj", "beacon_k_proj", "beacon_v_proj"]
             lora_dropout=training_args.lora_dropout,
             bias=training_args.lora_bias,
             task_type="CAUSAL_LM",
@@ -1750,8 +1770,53 @@ def train(attn_implementation=None):
             **data_module
         )
  
-
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
+        print(f'resume training!')
+        # TODO 先提前 load no_lora_module weight
+        last_ckpt_dir = get_last_checkpoint(training_args.output_dir)
+        print(f'last_ckpt_dir: {last_ckpt_dir}')
+        non_lora_trainables_state_dict_path = os.path.join(last_ckpt_dir, "non_lora_trainables.bin")
+        # 载入 vision tower 权重
+        non_lora_trainables_state_dict = torch.load(non_lora_trainables_state_dict_path)
+
+        for name, param in model.get_vision_tower().named_parameters():
+            try:
+                mapping_name = 'base_model.model.model.vision_tower.' + name
+                new_val = non_lora_trainables_state_dict[mapping_name]
+            except:
+                mapping_name = 'module.base_model.model.model.vision_tower.' + name
+                new_val = non_lora_trainables_state_dict[mapping_name]
+
+            # new_val 的设备，数据类型， required_grad 和 原本的 param 一致
+            if new_val.device != param.device:
+                new_val = new_val.to(param.device)
+            # if new_val.dtype != param.dtype:
+            #     new_val = new_val.to(param.dtype)
+            if new_val.requires_grad != param.requires_grad:
+                new_val.requires_grad = param.requires_grad
+
+            param.data.copy_(new_val)
+    
+        for name, param in model.get_model().mm_projector.named_parameters():
+            try:
+                mapping_name = 'base_model.model.model.mm_projector.' + name
+                new_val = non_lora_trainables_state_dict[mapping_name] # non_lora_trainables_state_dict['base_model.model.model.mm_projector.' + name]
+            except:
+                mapping_name = 'module.base_model.model.model.mm_projector.' + name
+                new_val = non_lora_trainables_state_dict[mapping_name]
+
+            # new_val 的设备，数据类型， required_grad 和 原本的 param 一致
+            if new_val.device != param.device:
+                new_val = new_val.to(param.device)
+            # if new_val.dtype != param.dtype:
+            #     new_val = new_val.to(param.dtype)
+            if new_val.requires_grad != param.requires_grad:
+                new_val.requires_grad = param.requires_grad
+
+            param.data.copy_(new_val)
+
+        print(model)
+
         trainer.train(resume_from_checkpoint=True)
     else:
         trainer.train()

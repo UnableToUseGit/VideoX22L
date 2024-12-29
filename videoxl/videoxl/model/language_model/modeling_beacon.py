@@ -54,6 +54,9 @@ class Memory(torch.nn.Module):
         self.only_lmk_loss = only_lmk_loss
         print(f'only_lmk_loss: {self.only_lmk_loss}')
         self.only_next_token_loss = only_next_token_loss
+        print(f'only_next_token_loss: {self.only_next_token_loss}')
+
+        self.random_reload_flag = True
     
     @property
     def beacon_token(self):

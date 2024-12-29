@@ -70,6 +70,7 @@ def process_video_with_pyav(video_file, data_args, gt_time_span=None):
         candidate_frames = [ [] for _ in gt_time_span ]
         candidate_frames_idx = [ [] for _ in gt_time_span ]
 
+    container.close()
     container = av.open(video_file)
     for index, frame in enumerate(container.decode(video=0)):
         if index in frame_idx:
@@ -94,9 +95,9 @@ def process_video_with_pyav(video_file, data_args, gt_time_span=None):
                         candidate_frames_idx[span_idx].append(index)
                         break
         
-    
+    container.close()
     if len(gt_frame_idx) == 0 and gt_time_span is not None:  # 采样没采到，需要强行加入
-        # print(f'==================检验强行采样机制:==================')
+        print(f'触发强行采样机制: {video_file}')
         # 加入到对应位置
         for span_idx, single_gt_time_span in enumerate(gt_time_span):
             # 这个时间范围内第一帧的 idx (1fps original video)
@@ -119,7 +120,6 @@ def process_video_with_pyav(video_file, data_args, gt_time_span=None):
             gt_frame_idx.extend(gt_frame_idx_this_span)
 
     video = np.stack(video_frames)
-    # print(f"video.shape: {video.shape}")
 
     return video, gt_frame_idx
 
