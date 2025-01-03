@@ -2096,15 +2096,6 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         video_id=None
     ):
 
-        self.memory.prepare(
-            input_ids=input_ids, 
-            attention_mask=attention_mask, 
-            labels=labels,
-            skip_first=beacon_skip_first,
-            skip_last=beacon_skip_last,
-        )
- 
-
         # TODO 推理的时候 保证 ground_truth_pos 为 None，否则 outputs 中会有 loss 这一项，返回回去会报错
         # gt_frame_idx = None
         if gt_frame_idx is not None and gt_frame_idx[0] is not None: 
@@ -2120,6 +2111,16 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             ground_truth_pos_dict = dict(Counter(ground_truth_pos))
         else:
             ground_truth_pos = None
+
+        self.memory.gt_chunk_idx = ground_truth_pos
+
+        self.memory.prepare(
+            input_ids=input_ids, 
+            attention_mask=attention_mask, 
+            labels=labels,
+            skip_first=beacon_skip_first,
+            skip_last=beacon_skip_last,
+        )
 
         # 只在训练时启用
         if self.training:
@@ -2221,9 +2222,11 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         cache_position=None,
         gt_frame_idx=None,
         video_id=None,    # video_id
+        frames_chunks=None,
+        **kwargs,
         ) -> Union[Tuple, CausalLMOutputWithPast]:
         
-        frames_chunks = None
+        # frames_chunks = None
         
         if image_features is None:
             if input_ids.shape[1] != 1:
@@ -2301,9 +2304,10 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         modalities: Optional[List[str]] = ["image"],
         beacon_skip_first: Optional[int] = None,
         beacon_skip_last: Optional[int] = None,
+        gt_frame_idx: Optional[int] = None,
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
-
+        
         position_ids = kwargs.pop("position_ids", None)
         attention_mask = kwargs.pop("attention_mask", None)
         if "inputs_embeds" in kwargs:
@@ -2320,7 +2324,8 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         # print("generate_id",inputs,image_features.shape)
       
         kwargs["window_context"] = window_context
-        # kwargs["frames_chunks"] = frames_chunks
+        kwargs["gt_frame_idx"] = gt_frame_idx
+        kwargs["frames_chunks"] = frames_chunks
 
         num_tokens=image_features.shape[0]
       
@@ -2343,9 +2348,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 inputs=input_ids
                 # print("new_input_id",inputs)
 
-
-        return super().generate(position_ids=position_ids, attention_mask=attention_mask,inputs=inputs,beacon_skip_first=beacon_skip_first, beacon_skip_last= beacon_skip_last, **kwargs)
-
+        return super().generate(position_ids=position_ids, attention_mask=attention_mask,inputs=inputs,beacon_skip_first=beacon_skip_first, beacon_skip_last=beacon_skip_last, **kwargs)
 
 
 
@@ -2363,11 +2366,15 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         
         if "window_context" in kwargs:
             model_inputs["window_context"] = kwargs['window_context']
+
+        if "gt_frame_idx" in kwargs:
+            model_inputs["gt_frame_idx"] = kwargs['gt_frame_idx']
+
+        if "frames_chunks" in kwargs:
+            model_inputs["frames_chunks"] = kwargs['frames_chunks']
         
         # if "frames_chunks" in kwargs:
         #     model_inputs["frames_chunks"] = kwargs['frames_chunks']
-        
-
         return model_inputs
     
     

@@ -57,6 +57,8 @@ class Memory(torch.nn.Module):
         print(f'only_next_token_loss: {self.only_next_token_loss}')
 
         self.random_reload_flag = True
+
+        self.gt_chunk_idx = None
     
     @property
     def beacon_token(self):
@@ -142,6 +144,8 @@ class Memory(torch.nn.Module):
         self.has_reloaded = False
 
         self.query_sep_pos_id_left = -1
+
+        self.gt_chunk_idx = None
 
     @property
     def all_sequence_length(self):
@@ -521,7 +525,7 @@ class Memory(torch.nn.Module):
         end_idx = start_idx + self.beacon_window
         # indicates if the current window is completely filled by raw activations and new tokens
         # we only append beacon tokens for full windows
-        if end_idx > self.all_sequence_length:
+        if end_idx > self.all_sequence_length:  # 生成阶段会触发这个
             # the input is shorter than the initial window size
             end_idx = self.all_sequence_length
             is_full_window = False
@@ -548,7 +552,7 @@ class Memory(torch.nn.Module):
             compression_ratio = -1
         
         # NOTE: we do not compress tokens after beacon_skip_last tokens
-        elif self.beacon_skip_last is not None and start_idx >= self.beacon_skip_last:
+        elif self.beacon_skip_last is not None and start_idx >= self.beacon_skip_last:  # 生成阶段会触发这个
             end_idx = min(start_idx + self.beacon_window, self.all_sequence_length)
             next_start_idx = end_idx
             is_full_window = False
@@ -591,6 +595,12 @@ class Memory(torch.nn.Module):
                 # set compression ratio once the previous window has finished, otherwise, reuse the interleave_compression_ratio if the input belongs to an unfinished window
                 if self.is_full_window:
                     compression_ratio = self.set_compression_ratio(start_idx=start_idx, end_idx=end_idx)
+
+                    # 如果 gt chunk idx 已经指定，则 gt chunk 的压缩率固定为 2
+                    if self.gt_chunk_idx is not None:
+                        if len(self.chunk_infos) - 1 in self.gt_chunk_idx:
+                            compression_ratio = 2
+                
                     self.interleave_compression_ratio = compression_ratio
                 else:
                     compression_ratio = self.interleave_compression_ratio
@@ -646,7 +656,7 @@ class Memory(torch.nn.Module):
                 input_ids_with_beacons = input_ids.new_full((input_ids.shape[0], input_len + beacon_size), self.beacon_token)
                 raw_token_indices = torch.arange(input_ids_with_beacons.shape[1], device=input_ids.device)
                 interleave_start_idx = compression_ratio - self.interleave_remainder
-                raw_token_indices = raw_token_indices[raw_token_indices % (compression_ratio + 1) != interleave_start_idx].unsqueeze(0).expand_as(input_ids)
+                raw_token_indices = raw_token_indices[raw_token_indices % (compression_ratio + 1) != interleave_start_idx].unsqueeze(0).expand_as(input_ids)                
                 input_ids_with_beacons = input_ids_with_beacons.scatter(dim=1, index=raw_token_indices, src=input_ids)
                 input_ids = input_ids_with_beacons
                 # attention mask
