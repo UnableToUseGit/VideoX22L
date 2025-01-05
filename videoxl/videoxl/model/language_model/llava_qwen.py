@@ -1976,6 +1976,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         reload_top_k = kwargs.pop('reload_top_k', 3)
         only_lmk_loss = kwargs.pop('only_lmk_loss', False)
         only_next_token_loss = kwargs.pop('only_next_token_loss', False)
+        downsample_ratio = kwargs.pop('downsample_ratio', False)
         kwargs.update(output_loading_info=True)
         model, loading_info = super().from_pretrained(*args, **kwargs)
 
@@ -2107,10 +2108,29 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     if chunk[0] <= each_gt_frame_idx < chunk[1]:
                         ground_truth_pos.append(chunk_idx)
 
-            from collections import Counter
-            ground_truth_pos_dict = dict(Counter(ground_truth_pos))
         else:
             ground_truth_pos = None
+
+        # NOTE: EXP 用于模拟更真实的情况
+        if ground_truth_pos is not None:
+            topk = 3
+            hit_ratio = 0.7
+            if random.random() < hit_ratio:
+                new_ground_truth_pos = list(set(ground_truth_pos))
+            else:
+                # new_ground_truth_pos = []
+                new_ground_truth_pos = None
+            
+            ground_truth_pos = new_ground_truth_pos
+            # need_to_sample = topk - len(new_ground_truth_pos)
+
+            # if need_to_sample > 0:
+            #     the_rest_chunk_idx = [chunk_idx for chunk_idx, chunk in enumerate(frames_chunks) if chunk_idx not in ground_truth_pos]
+            #     random_sample_truth_pos = random.sample(the_rest_chunk_idx, need_to_sample)
+            #     new_ground_truth_pos = new_ground_truth_pos + random_sample_truth_pos
+            #     ground_truth_pos = new_ground_truth_pos
+            # else:
+            #     ground_truth_pos = new_ground_truth_pos
 
         self.memory.gt_chunk_idx = ground_truth_pos
 
