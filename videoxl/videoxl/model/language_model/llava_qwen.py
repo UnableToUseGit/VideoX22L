@@ -2111,17 +2111,17 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         else:
             ground_truth_pos = None
 
-        # NOTE: EXP 用于模拟更真实的情况
-        if ground_truth_pos is not None:
-            topk = 3
-            hit_ratio = 0.7
-            if random.random() < hit_ratio:
-                new_ground_truth_pos = list(set(ground_truth_pos))
-            else:
-                # new_ground_truth_pos = []
-                new_ground_truth_pos = None
+        # NOTE: qin EXP 用于模拟更真实的情况
+        # if ground_truth_pos is not None:
+        #     topk = 3
+        #     hit_ratio = 0.7
+        #     if random.random() < hit_ratio:
+        #         new_ground_truth_pos = list(set(ground_truth_pos))
+        #     else:
+        #         # new_ground_truth_pos = []
+        #         new_ground_truth_pos = None
             
-            ground_truth_pos = new_ground_truth_pos
+        #     ground_truth_pos = new_ground_truth_pos
             # need_to_sample = topk - len(new_ground_truth_pos)
 
             # if need_to_sample > 0:

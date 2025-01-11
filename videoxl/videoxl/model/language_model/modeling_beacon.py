@@ -600,8 +600,8 @@ class Memory(torch.nn.Module):
                     if self.gt_chunk_idx is not None:
                         if len(self.chunk_infos) - 1 in self.gt_chunk_idx:
                             compression_ratio = 2
-                    # if len(self.chunk_infos) - 1 == 0 or len(self.chunk_infos) - 1 == 25: 
-                    #     compression_ratio = 2
+                    if len(self.chunk_infos) - 1 == 0 or len(self.chunk_infos) - 1 == 25: 
+                        compression_ratio = 2
                     self.interleave_compression_ratio = compression_ratio
                 else:
                     compression_ratio = self.interleave_compression_ratio
