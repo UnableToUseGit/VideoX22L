@@ -2099,17 +2099,20 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
 
         # TODO 推理的时候 保证 ground_truth_pos 为 None，否则 outputs 中会有 loss 这一项，返回回去会报错
         # gt_frame_idx = None
-        if gt_frame_idx is not None and gt_frame_idx[0] is not None: 
-            if type(gt_frame_idx[0]) == type([]):
-                gt_frame_idx = gt_frame_idx[0]
-            ground_truth_pos = []
-            for chunk_idx, chunk in enumerate(frames_chunks):
-                for each_gt_frame_idx in gt_frame_idx:
-                    if chunk[0] <= each_gt_frame_idx < chunk[1]:
-                        ground_truth_pos.append(chunk_idx)
+        # if gt_frame_idx is not None and gt_frame_idx[0] is not None: 
+        #     if type(gt_frame_idx[0]) == type([]):
+        #         gt_frame_idx = gt_frame_idx[0]
+        #     ground_truth_pos = []
+        #     for chunk_idx, chunk in enumerate(frames_chunks):
+        #         for each_gt_frame_idx in gt_frame_idx:
+        #             if chunk[0] <= each_gt_frame_idx < chunk[1]:
+        #                 ground_truth_pos.append(chunk_idx)
 
-        else:
-            ground_truth_pos = None
+        # else:
+        #     ground_truth_pos = None
+
+        # NOTE: qin gt_frame_idx 此时传进去的是 chunk idx，所以直接赋值
+        ground_truth_pos = gt_frame_idx
 
         # NOTE: qin EXP 用于模拟更真实的情况
         # if ground_truth_pos is not None:
