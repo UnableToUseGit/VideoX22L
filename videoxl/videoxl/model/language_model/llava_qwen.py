@@ -2077,6 +2077,9 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             attentions=outputs.attentions,
         )
 
+    # def memory_loop(self):
+        
+
     def _beacon_forward(self, 
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -2135,91 +2138,126 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             # else:
             #     ground_truth_pos = new_ground_truth_pos
 
-        self.memory.gt_chunk_idx = ground_truth_pos
+        record_input_ids = input_ids.clone()
+        record_attention_mask = attention_mask.clone()
+        record_labels = labels.clone()
 
-        self.memory.prepare(
-            input_ids=input_ids, 
-            attention_mask=attention_mask, 
-            labels=labels,
-            skip_first=beacon_skip_first,
-            skip_last=beacon_skip_last,
-        )
-
-        # 只在训练时启用
-        if self.training:
-            rendom_reload_ratio = random.random()
-            if rendom_reload_ratio <= 0.6:
-                self.memory.random_reload_flag = True
-            else:
-                self.memory.random_reload_flag = False
-        else:
-            self.memory.random_reload_flag = True
-        # self.memory.random_reload_flag = True
-
-        # after the first window, one token at a time
-        lmk_loss = 0
-        while not self.memory.finish:
-
-            # NOTE: Dynamic chunk mechanism
-            if self.memory.count!=0:
-                if self.memory.count <= len(window_context):
-                    self.memory.config.beacon_window = window_context[self.memory.count-1]
-                    self.memory.config.beacon_stride = window_context[self.memory.count-1]
-                else:
-                    self.memory.config.beacon_window = 1440
-                    self.memory.config.beacon_stride = 1440
-            self.memory.count+=1
-
-            input_ids, attention_mask_all_layers, position_ids_all_layers, past_key_values, labels = self.memory.step()
-
-            outputs = self._native_forward(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                attention_mask_all_layers=attention_mask_all_layers,
-                position_ids=position_ids,
-                position_ids_all_layers=position_ids_all_layers,
-                past_key_values=past_key_values,
-                inputs_embeds=inputs_embeds,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-                labels=labels,
-                # NOTE: the labels have been shifted so that all tokens in the window have the proper loss
-                shift_labels=False,
-                image_features=image_features,
-                ground_truth_pos=ground_truth_pos
+        if input_ids.shape[-1] == 1:
+            self.memory.gt_chunk_idx = ground_truth_pos
+            self.memory.prepare(
+                input_ids=record_input_ids, 
+                attention_mask=record_attention_mask, 
+                labels=record_labels,
+                skip_first=beacon_skip_first,
+                skip_last=beacon_skip_last,
             )
 
+            lmk_loss = 0
+            while not self.memory.finish:
+                # NOTE: Dynamic chunk mechanism
+                if self.memory.count!=0:
+                    if self.memory.count <= len(window_context):
+                        self.memory.config.beacon_window = window_context[self.memory.count-1]
+                        self.memory.config.beacon_stride = window_context[self.memory.count-1]
+                    else:
+                        self.memory.config.beacon_window = 1440
+                        self.memory.config.beacon_stride = 1440
+                self.memory.count+=1
 
-            # update past_key_values
-            self.memory.update_memory(outputs.past_key_values)
+                input_ids, attention_mask_all_layers, position_ids_all_layers, past_key_values, labels = self.memory.step()
 
-            # t6 = time.time()
+                outputs = self._native_forward(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    attention_mask_all_layers=attention_mask_all_layers,
+                    position_ids=position_ids,
+                    position_ids_all_layers=position_ids_all_layers,
+                    past_key_values=past_key_values,
+                    inputs_embeds=inputs_embeds,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=return_dict,
+                    labels=labels,
+                    # NOTE: the labels have been shifted so that all tokens in the window have the proper loss
+                    shift_labels=False,
+                    image_features=image_features,
+                    ground_truth_pos=ground_truth_pos
+                )
+                # update past_key_values
+                self.memory.update_memory(outputs.past_key_values)
+                # t6 = time.time()
+                if labels is not None:
+                    self.memory.update_loss(outputs.batch_loss, outputs.valid_token_num)
 
-            if labels is not None:
-                # update loss
-                # print(f"loss: {outputs.loss}")
-                # print(f"batch_loss: {outputs.batch_loss}")
-                self.memory.update_loss(outputs.batch_loss, outputs.valid_token_num)
+                if outputs.lmk_loss is not None:
+                    lmk_loss = lmk_loss + outputs.lmk_loss
 
-            if outputs.lmk_loss is not None:
-                lmk_loss = lmk_loss + outputs.lmk_loss
-                # print(f'this sample lmk_loss: {lmk_loss}')
+            if lmk_loss == 0:
+                lmk_loss = None
+            outputs = self.memory.output(outputs, lmk_loss=lmk_loss)
+        else:
+            for beacon_ratio in [2,32]:
+                self.memory.reset()
+                self.memory.config.beacon_ratio = beacon_ratio
+                self.memory.gt_chunk_idx = ground_truth_pos
+                self.memory.prepare(
+                    input_ids=record_input_ids, 
+                    attention_mask=record_attention_mask, 
+                    labels=record_labels,
+                    skip_first=beacon_skip_first,
+                    skip_last=beacon_skip_last,
+                )
 
+                # after the first window, one token at a time
+                lmk_loss = 0
+                while not self.memory.finish:
+                    # NOTE: Dynamic chunk mechanism
+                    if self.memory.count!=0:
+                        if self.memory.count <= len(window_context):
+                            self.memory.config.beacon_window = window_context[self.memory.count-1]
+                            self.memory.config.beacon_stride = window_context[self.memory.count-1]
+                        else:
+                            self.memory.config.beacon_window = 1440
+                            self.memory.config.beacon_stride = 1440
+                    self.memory.count+=1
 
-        # output loss, past_key_values, and perplexity
-        if lmk_loss == 0:
-            lmk_loss = None
-        
-        # if random.random() < 0.00001 :
-        #     print(f'lmk_loss: {lmk_loss}')
-        #     print(f'loss: {outputs.loss}')
-        #     print(f'batch_loss: {outputs.batch_loss}')
-        outputs = self.memory.output(outputs, lmk_loss=lmk_loss)
-        # if random.random() < 0.00001 :
-        #     print(f'after outputs loss: {outputs.loss}')
-        #     print(f'after outputs batch_loss: {outputs.batch_loss}')
+                    input_ids, attention_mask_all_layers, position_ids_all_layers, past_key_values, labels = self.memory.step()
+
+                    outputs = self._native_forward(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        attention_mask_all_layers=attention_mask_all_layers,
+                        position_ids=position_ids,
+                        position_ids_all_layers=position_ids_all_layers,
+                        past_key_values=past_key_values,
+                        inputs_embeds=inputs_embeds,
+                        use_cache=use_cache,
+                        output_attentions=output_attentions,
+                        output_hidden_states=output_hidden_states,
+                        return_dict=return_dict,
+                        labels=labels,
+                        # NOTE: the labels have been shifted so that all tokens in the window have the proper loss
+                        shift_labels=False,
+                        image_features=image_features,
+                        ground_truth_pos=ground_truth_pos
+                    )
+                    # update past_key_values
+                    self.memory.update_memory(outputs.past_key_values)
+                    # t6 = time.time()
+                    if labels is not None:
+                        self.memory.update_loss(outputs.batch_loss, outputs.valid_token_num)
+
+                    if outputs.lmk_loss is not None:
+                        lmk_loss = lmk_loss + outputs.lmk_loss
+
+                if lmk_loss == 0:
+                    lmk_loss = None
+
+                outputs = self.memory.output(outputs, lmk_loss=lmk_loss)
+
+            # 根据 gt chunk 将高密度载入低密度
+            
 
         return outputs
 

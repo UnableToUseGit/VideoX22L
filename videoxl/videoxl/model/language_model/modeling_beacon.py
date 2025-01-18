@@ -597,9 +597,9 @@ class Memory(torch.nn.Module):
                     compression_ratio = self.set_compression_ratio(start_idx=start_idx, end_idx=end_idx)
 
                     # NOTE: qin EXP 如果 gt chunk idx 已经指定，则 gt chunk 的压缩率固定为 2
-                    if self.gt_chunk_idx is not None:
-                        if len(self.chunk_infos) - 1 in self.gt_chunk_idx:
-                            compression_ratio = 2
+                    # if self.gt_chunk_idx is not None:
+                    #     if len(self.chunk_infos) - 1 in self.gt_chunk_idx:
+                    #         compression_ratio = 2
                     # if len(self.chunk_infos) - 1 == 0 or len(self.chunk_infos) - 1 == 25: 
                     #     compression_ratio = 2
                     self.interleave_compression_ratio = compression_ratio
