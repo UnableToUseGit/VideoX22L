@@ -13,6 +13,7 @@
 #    limitations under the License.
 
 import random
+random.seed(42)
 from typing import List, Optional, Tuple, Union, Dict
 import torch
 import torch.nn as nn
@@ -65,11 +66,14 @@ import pdb
 import psutil
 from loguru import logger as eval_logger
 
+import time
+
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
 
     _flash_supports_window_size = "window_size" in list(inspect.signature(flash_attn_func).parameters)
+
 logger = logging.get_logger(__name__)
 
 torch.utils.checkpoint.set_checkpoint_debug_enabled(True)
@@ -2079,6 +2083,15 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
 
     # def memory_loop(self):
         
+    def cat_tensor(self, list_of_tensors, dim=-1):
+        list_of_tensors = [t for t in list_of_tensors if t is not None]
+        if len(list_of_tensors) > 1:
+            result = torch.cat(list_of_tensors, dim=dim)
+        elif len(list_of_tensors) == 1:
+            result = list_of_tensors[0]
+        else:
+            result = None
+        return result
 
     def _beacon_forward(self, 
         input_ids: torch.LongTensor = None,
@@ -2139,9 +2152,15 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             #     ground_truth_pos = new_ground_truth_pos
 
         record_input_ids = input_ids.clone()
-        record_attention_mask = attention_mask.clone()
-        record_labels = labels.clone()
-
+        if attention_mask is not None:
+            record_attention_mask = attention_mask.clone()
+        else:
+            record_attention_mask = attention_mask
+        if labels is not None:
+            record_labels = labels.clone()
+        else:
+            record_labels = labels
+        
         if input_ids.shape[-1] == 1:
             self.memory.gt_chunk_idx = ground_truth_pos
             self.memory.prepare(
@@ -2197,9 +2216,10 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 lmk_loss = None
             outputs = self.memory.output(outputs, lmk_loss=lmk_loss)
         else:
+            record_beacon_activations = {}
             for beacon_ratio in [2,32]:
                 self.memory.reset()
-                self.memory.config.beacon_ratio = beacon_ratio
+                self.memory.config.beacon_ratio = [beacon_ratio]
                 self.memory.gt_chunk_idx = ground_truth_pos
                 self.memory.prepare(
                     input_ids=record_input_ids, 
@@ -2244,6 +2264,53 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     )
                     # update past_key_values
                     self.memory.update_memory(outputs.past_key_values)
+
+                    if len(self.memory.offload_activations[0]) == 26 and past_key_values[0][-2] != 0: 
+                    # if len(self.memory.offload_activations[0]) == 13 and past_key_values[0][-2] != 0: 
+                        record_beacon_activations[beacon_ratio] = self.memory.offload_activations
+
+                    if beacon_ratio == 32 and len(self.memory.offload_activations[0]) == 26 and past_key_values[0][-2]!=0:   # visual 已经完成 并且不是 query
+                    # if beacon_ratio == 32 and len(self.memory.offload_activations[0]) == 13 and past_key_values[0][-2]!=0:   # visual 已经完成 并且不是 query
+                        start = time.time()
+                        # 根据 gt chunk 将高密度载入低密度
+                        reload_activations = []
+                        
+                        # ground_truth_pos = list(range(0,13))
+
+                        # pb = random.random()
+                        # if 0 <= pb < 0.2:
+                        #     gt_num = 1
+                        # elif 0.2 <= pb < 0.5:
+                        #     gt_num = 2
+                        # elif 0.5 <= pb < 0.8:
+                        #     gt_num = 3
+                        # elif 0.8 <= pb < 0.9:
+                        #     gt_num = 4
+                        # elif 0.9 <= pb <= 1.0:
+                        #     gt_num = 5
+                            
+                        # ground_truth_pos = random.sample(ground_truth_pos, gt_num)
+
+                        for layer_idx in range(self.memory.config.num_hidden_layers):
+                            reload_activations.append( record_beacon_activations[32][layer_idx] )
+                            if ground_truth_pos is not None:
+                                # NOTE: qin
+                                # ground_truth_pos = list(set(ground_truth_pos + [0, 25]))
+                                for chunk_idx in ground_truth_pos:
+                                    reload_activations[-1][chunk_idx] = record_beacon_activations[2][layer_idx][chunk_idx]
+
+                        end = time.time()
+                        
+                        # print(f'time 1: {end - start}s')
+                        start = time.time()
+                        for layer_idx in range(self.memory.config.num_hidden_layers):
+                            key_states_this_layer = [ tmp[0] for tmp in reload_activations[layer_idx] ]
+                            val_states_this_layer = [ tmp[1] for tmp in reload_activations[layer_idx] ]
+                            self.memory.beacon_activations[layer_idx] = (self.cat_tensor(key_states_this_layer, dim=2).detach(), self.cat_tensor(val_states_this_layer,dim=2).detach())
+                        end = time.time()
+                        # print(f'time 2: {end - start}s')
+                        # cat 为beacon activations 然后替换进去
+
                     # t6 = time.time()
                     if labels is not None:
                         self.memory.update_loss(outputs.batch_loss, outputs.valid_token_num)
@@ -2255,9 +2322,6 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     lmk_loss = None
 
                 outputs = self.memory.output(outputs, lmk_loss=lmk_loss)
-
-            # 根据 gt chunk 将高密度载入低密度
-            
 
         return outputs
 

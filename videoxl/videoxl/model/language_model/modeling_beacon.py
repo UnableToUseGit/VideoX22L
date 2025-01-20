@@ -142,9 +142,7 @@ class Memory(torch.nn.Module):
 
         self.chunk_infos = []
         self.has_reloaded = False
-
         self.query_sep_pos_id_left = -1
-
         self.gt_chunk_idx = None
 
     @property
@@ -600,8 +598,8 @@ class Memory(torch.nn.Module):
                     # if self.gt_chunk_idx is not None:
                     #     if len(self.chunk_infos) - 1 in self.gt_chunk_idx:
                     #         compression_ratio = 2
-                    # if len(self.chunk_infos) - 1 == 0 or len(self.chunk_infos) - 1 == 25: 
-                    #     compression_ratio = 2
+                    if len(self.chunk_infos) - 1 in [0,25]: 
+                        compression_ratio = 2
                     self.interleave_compression_ratio = compression_ratio
                 else:
                     compression_ratio = self.interleave_compression_ratio
@@ -852,13 +850,6 @@ class Memory(torch.nn.Module):
             # NOTE: the past_key_values are incrementally returned (only the new keys and values are returned)
             previous_raw_key, previous_raw_value = self.raw_activations[layer_idx]
 
-            # NOTE: custome code
-            if self.reload_enable:
-                self.offload_activations[layer_idx].append([
-                    key.detach(),
-                    value.detach(),
-                ])
-
             if self.beacon_skip_first is not None and self.sink_activations[layer_idx][0] is None:
                 assert key.shape[self.k_seq_dim] == self.beacon_skip_first
                 assert value.shape[self.k_seq_dim] == self.beacon_skip_first
@@ -895,7 +886,7 @@ class Memory(torch.nn.Module):
                 # NOTE: use the correct previous_beacon_key and value!
                 previous_beacon_key, previous_beacon_value = self.beacon_activations[layer_idx]
                 try:
-                    beacon_key, beacon_value, raw_key, raw_value = self._extract_beacon_and_raw_memory(
+                    beacon_key, beacon_value, raw_key, raw_value, current_beacon_key, current_beacon_value = self._extract_beacon_and_raw_memory(
                         key, 
                         value, 
                         previous_beacon_key, 
@@ -909,6 +900,10 @@ class Memory(torch.nn.Module):
 
                 self.beacon_activations[layer_idx] = (beacon_key, beacon_value)
                 self.raw_activations[layer_idx] = (raw_key, raw_value)
+                self.offload_activations[layer_idx].append([
+                    current_beacon_key.clone(),
+                    current_beacon_value.clone(),
+                ])
 
     def update_loss(self, batch_loss, valid_token_num):
         """
@@ -1152,12 +1147,12 @@ class Memory(torch.nn.Module):
         ], dim=self.v_seq_dim)
 
         # NOTE: we use magic slice instead of boolean index here for efficiency
-        beacon_key = slice_tensor(key, index=torch.logical_or(beacon_indices == 1, beacon_indices == -1), dim=self.k_seq_dim)
-        beacon_value = slice_tensor(value, index=torch.logical_or(beacon_indices == 1, beacon_indices == -1), dim=self.v_seq_dim)
+        current_beacon_key = slice_tensor(key, index=torch.logical_or(beacon_indices == 1, beacon_indices == -1), dim=self.k_seq_dim)
+        current_beacon_value = slice_tensor(value, index=torch.logical_or(beacon_indices == 1, beacon_indices == -1), dim=self.v_seq_dim)
 
         if self.config.beacon_accum:
-            beacon_key = cat_tensor([previous_beacon_key, beacon_key], dim=self.k_seq_dim)
-            beacon_value = cat_tensor([previous_beacon_value, beacon_value], dim=self.v_seq_dim)
+            beacon_key = cat_tensor([previous_beacon_key, current_beacon_key], dim=self.k_seq_dim)
+            beacon_value = cat_tensor([previous_beacon_value, current_beacon_value], dim=self.v_seq_dim)
 
         if self.raw_size_to_cache > 0:
             raw_key = slice_tensor(key, index=beacon_indices == 0, dim=self.k_seq_dim)
@@ -1170,7 +1165,7 @@ class Memory(torch.nn.Module):
             raw_key = None
             raw_value = None
 
-        return beacon_key, beacon_value, raw_key, raw_value
+        return beacon_key, beacon_value, raw_key, raw_value, current_beacon_key, current_beacon_value
 
 
 def slice_tensor(x, start=None, end=None, step=None, index=None, dim=2):
