@@ -2275,8 +2275,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                         # 根据 gt chunk 将高密度载入低密度
                         reload_activations = []
                         
-                        # ground_truth_pos = list(range(0,13))
-
+                        # ground_truth_pos = list(range(1,12))
                         # pb = random.random()
                         # if 0 <= pb < 0.2:
                         #     gt_num = 1
@@ -2290,7 +2289,16 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                         #     gt_num = 5
                             
                         # ground_truth_pos = random.sample(ground_truth_pos, gt_num)
+                        # # 开头和结尾的 chunk 始终是高密度
+                        # ground_truth_pos.extend([0,12])
+                        # ground_truth_pos = list(set(ground_truth_pos))
 
+
+                        # gt_num = 4
+                        # ground_truth_pos = list(range(0,26))
+                        # ground_truth_pos = random.sample(ground_truth_pos, gt_num)
+                        ground_truth_pos = [0,25]
+                        
                         for layer_idx in range(self.memory.config.num_hidden_layers):
                             reload_activations.append( record_beacon_activations[32][layer_idx] )
                             if ground_truth_pos is not None:

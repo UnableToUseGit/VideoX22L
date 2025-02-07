@@ -1680,7 +1680,7 @@ def train(attn_implementation=None):
         model = get_peft_model(model, lora_config)
 
     print(f'lora_config: {lora_config}')
-    print(f'target_modules: {target_modules}')
+    print(f'model after lora: {model}')
     
     if "mistral" in model_args.model_name_or_path.lower() or "mixtral" in model_args.model_name_or_path.lower() or "zephyr" in model_args.model_name_or_path.lower():
         tokenizer = transformers.AutoTokenizer.from_pretrained(model_args.model_name_or_path, cache_dir=training_args.cache_dir, model_max_length=training_args.model_max_length, padding_side="left")
