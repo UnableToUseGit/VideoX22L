@@ -593,12 +593,16 @@ class Memory(torch.nn.Module):
                 # set compression ratio once the previous window has finished, otherwise, reuse the interleave_compression_ratio if the input belongs to an unfinished window
                 if self.is_full_window:
                     compression_ratio = self.set_compression_ratio(start_idx=start_idx, end_idx=end_idx)
-
+                    
                     # NOTE: qin EXP 如果 gt chunk idx 已经指定，则 gt chunk 的压缩率固定为 2
                     # if self.gt_chunk_idx is not None:
                     #     if len(self.chunk_infos) - 1 in self.gt_chunk_idx:
                     #         compression_ratio = 2
-                    # if len(self.chunk_infos) - 1 in [0,25]: 
+
+                    # if start_idx == self.beacon_skip_first or end_idx == self.beacon_skip_last:
+                    #     compression_ratio = 2
+
+                    # if len(self.chunk_infos) - 1 in [0,25]:  
                     #     compression_ratio = 2
                     self.interleave_compression_ratio = compression_ratio
                 else:
@@ -655,7 +659,10 @@ class Memory(torch.nn.Module):
                 input_ids_with_beacons = input_ids.new_full((input_ids.shape[0], input_len + beacon_size), self.beacon_token)
                 raw_token_indices = torch.arange(input_ids_with_beacons.shape[1], device=input_ids.device)
                 interleave_start_idx = compression_ratio - self.interleave_remainder
-                raw_token_indices = raw_token_indices[raw_token_indices % (compression_ratio + 1) != interleave_start_idx].unsqueeze(0).expand_as(input_ids)                
+                try:
+                    raw_token_indices = raw_token_indices[raw_token_indices % (compression_ratio + 1) != interleave_start_idx].unsqueeze(0).expand_as(input_ids)        
+                except:
+                    pdb.set_trace()        
                 input_ids_with_beacons = input_ids_with_beacons.scatter(dim=1, index=raw_token_indices, src=input_ids)
                 input_ids = input_ids_with_beacons
                 # attention mask

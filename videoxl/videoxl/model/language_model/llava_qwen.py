@@ -1795,36 +1795,39 @@ class Qwen2Model(Qwen2PreTrainedModel):
             # if self.image_idx==image_features.shape[0]:
             #     self.image_idx=0
 
-
-
+            # 获取当前的 beacon 索引
             cur_beacon_indices = beacon_indices[-input_ids.shape[1]:]
             beacon_input_ids = input_ids[:, cur_beacon_indices > 0]
-            # print("input_ids",input_ids)
-            special_token = self.config.vocab_size -1
-            inputs_embeds = torch.zeros(*input_ids.shape, image_features.shape[-1], device=input_ids.device, dtype=image_features.dtype)
 
-            batch_size, seq_len = input_ids.shape
+            # 定义特殊标记
+            special_token = self.config.vocab_size - 1
 
-            adjusted_image_idx=0
-            for batch_idx in range(batch_size):
-                for seq_idx in range(seq_len):
-                    if input_ids[batch_idx, seq_idx] == special_token:
-                        # print("idx",self.image_idx+adjusted_image_idx)
-                        # print("11",image_features[self.image_idx+adjusted_image_idx].shape)
-                        # print("11",seq_idx,self.image_idx+adjusted_image_idx)
-                        # print("image",image_features[self.image_idx+adjusted_image_idx].shape)  # 3584
-                        inputs_embeds[batch_idx, seq_idx] = image_features[self.image_idx+adjusted_image_idx]
-                        adjusted_image_idx+=1
+            # 初始化 inputs_embeds
+            inputs_embeds = torch.zeros(
+                (*input_ids.shape, image_features.shape[-1]),
+                device=input_ids.device,
+                dtype=image_features.dtype
+            )
 
-            count = (input_ids == special_token).sum().item()
-            self.image_idx += count
+            # 创建布尔掩码，标识 input_ids 中等于 special_token 的位置
+            mask = input_ids == special_token
+            count = mask.sum()
 
-            if self.image_idx==image_features.shape[0]:
-                self.image_idx=0
+            if count > 0:
+                # 计算需要插入的 image_features 的索引，考虑循环
+                image_indices = (self.image_idx + torch.arange(count, device=input_ids.device)) % image_features.shape[0]
+                
+                # 获取对应的 image_features
+                selected_image_features = image_features[image_indices]
+                
+                # 将选中的 image_features 赋值给 inputs_embeds 中对应的位置
+                inputs_embeds[mask] = selected_image_features
+                
+                # 更新 self.image_idx，确保其在 image_features 的范围内循环
+                self.image_idx = (self.image_idx + count) % image_features.shape[0]
 
             # 对 beacon_input_ids 进行嵌入
             beacon_input_embeds = self.beacon_embed_tokens(beacon_input_ids - self.config.vocab_size)
-            # print("beacon",beacon_input_embeds.shape, adjusted_image_idx)
             inputs_embeds[:, cur_beacon_indices > 0] = beacon_input_embeds
       
         else:
@@ -2217,7 +2220,8 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             outputs = self.memory.output(outputs, lmk_loss=lmk_loss)
         else:
             record_beacon_activations = {}
-            for beacon_ratio in [2,32]:
+            high_beacon_ratio = self.memory.config.beacon_ratio[0]
+            for beacon_ratio in [2,high_beacon_ratio]:
                 self.memory.reset()
                 self.memory.config.beacon_ratio = [beacon_ratio]
                 self.memory.gt_chunk_idx = ground_truth_pos
@@ -2265,12 +2269,11 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     # update past_key_values
                     self.memory.update_memory(outputs.past_key_values)
 
-                    if len(self.memory.offload_activations[0]) == 26 and past_key_values[0][-2] != 0: 
-                    # if len(self.memory.offload_activations[0]) == 13 and past_key_values[0][-2] != 0: 
+                    if self.memory.start_idx >= self.memory.beacon_skip_last and past_key_values[0][-2] != 0: 
                         record_beacon_activations[beacon_ratio] = self.memory.offload_activations
 
-                    if beacon_ratio == 32 and len(self.memory.offload_activations[0]) == 26 and past_key_values[0][-2]!=0:   # visual 已经完成 并且不是 query
-                    # if beacon_ratio == 32 and len(self.memory.offload_activations[0]) == 13 and past_key_values[0][-2]!=0:   # visual 已经完成 并且不是 query
+                    if beacon_ratio == high_beacon_ratio and self.memory.start_idx >= self.memory.beacon_skip_last and past_key_values[0][-2] != 0: 
+
                         start = time.time()
                         # 根据 gt chunk 将高密度载入低密度
                         reload_activations = []
@@ -2297,15 +2300,18 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                         # gt_num = 4
                         # ground_truth_pos = list(range(0,26))
                         # ground_truth_pos = random.sample(ground_truth_pos, gt_num)
-                        ground_truth_pos = [0,25]
+                        # ground_truth_pos = [0,25]
                         
                         for layer_idx in range(self.memory.config.num_hidden_layers):
-                            reload_activations.append( record_beacon_activations[32][layer_idx] )
+                            reload_activations.append( record_beacon_activations[high_beacon_ratio][layer_idx] )
                             if ground_truth_pos is not None:
                                 # NOTE: qin
                                 # ground_truth_pos = list(set(ground_truth_pos + [0, 25]))
-                                for chunk_idx in ground_truth_pos:
-                                    reload_activations[-1][chunk_idx] = record_beacon_activations[2][layer_idx][chunk_idx]
+                                try:
+                                    for chunk_idx in ground_truth_pos:
+                                        reload_activations[-1][chunk_idx] = record_beacon_activations[2][layer_idx][chunk_idx]
+                                except:
+                                    pdb.set_trace()
 
                         end = time.time()
                         
