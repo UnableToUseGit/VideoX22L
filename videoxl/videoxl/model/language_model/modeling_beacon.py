@@ -599,8 +599,8 @@ class Memory(torch.nn.Module):
                     #     if len(self.chunk_infos) - 1 in self.gt_chunk_idx:
                     #         compression_ratio = 2
                     # NOTE: qin  not be?
-                    # if start_idx == self.beacon_skip_first or end_idx == self.beacon_skip_last:
-                    #     compression_ratio = 2
+                    if start_idx == self.beacon_skip_first or end_idx == self.beacon_skip_last:
+                        compression_ratio = 2
 
                     # if len(self.chunk_infos) - 1 in [0,25]:  
                     #     compression_ratio = 2
