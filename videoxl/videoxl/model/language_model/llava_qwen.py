@@ -2220,8 +2220,9 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             outputs = self.memory.output(outputs, lmk_loss=lmk_loss)
         else:
             record_beacon_activations = {}
+            low_beacon_ratio = 4
             high_beacon_ratio = self.memory.config.beacon_ratio[0]
-            for beacon_ratio in [2,high_beacon_ratio]:
+            for beacon_ratio in [low_beacon_ratio,high_beacon_ratio]: # NOTE: change high
                 self.memory.reset()
                 self.memory.config.beacon_ratio = [beacon_ratio]
                 self.memory.gt_chunk_idx = ground_truth_pos
@@ -2306,10 +2307,9 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                             reload_activations.append( record_beacon_activations[high_beacon_ratio][layer_idx] )
                             if ground_truth_pos is not None:
                                 # NOTE: qin
-                                # ground_truth_pos = list(set(ground_truth_pos + [0, 25]))
                                 try:
                                     for chunk_idx in ground_truth_pos:
-                                        reload_activations[-1][chunk_idx] = record_beacon_activations[2][layer_idx][chunk_idx]
+                                        reload_activations[-1][chunk_idx] = record_beacon_activations[low_beacon_ratio][layer_idx][chunk_idx]
                                 except:
                                     pdb.set_trace()
 

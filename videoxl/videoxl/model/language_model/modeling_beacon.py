@@ -600,7 +600,7 @@ class Memory(torch.nn.Module):
                     #         compression_ratio = 2
                     # NOTE: qin not be?
                     if start_idx == self.beacon_skip_first or end_idx == self.beacon_skip_last:
-                        compression_ratio = 2
+                        compression_ratio = 4
 
                     self.interleave_compression_ratio = compression_ratio
                 else:
