@@ -2220,7 +2220,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             outputs = self.memory.output(outputs, lmk_loss=lmk_loss)
         else:
             record_beacon_activations = {}
-            low_beacon_ratio = 4
+            low_beacon_ratio = 2
             high_beacon_ratio = self.memory.config.beacon_ratio[0]
             for beacon_ratio in [low_beacon_ratio,high_beacon_ratio]: # NOTE: change high
                 self.memory.reset()
