@@ -2164,7 +2164,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         else:
             record_labels = labels
         
-        if input_ids.shape[-1] == 1:
+        if input_ids.shape[-1] == 1 or ground_truth_pos is None:
             self.memory.gt_chunk_idx = ground_truth_pos
             self.memory.prepare(
                 input_ids=record_input_ids, 
@@ -2219,6 +2219,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 lmk_loss = None
             outputs = self.memory.output(outputs, lmk_loss=lmk_loss)
         else:
+            print(f'start offline encoding!!!!')
             record_beacon_activations = {}
             low_beacon_ratio = 2
             high_beacon_ratio = self.memory.config.beacon_ratio[0]
