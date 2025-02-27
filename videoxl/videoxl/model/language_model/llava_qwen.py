@@ -2219,11 +2219,11 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 lmk_loss = None
             outputs = self.memory.output(outputs, lmk_loss=lmk_loss)
         else:
-            print(f'start offline encoding!!!!')
             record_beacon_activations = {}
             low_beacon_ratio = 2
             high_beacon_ratio = self.memory.config.beacon_ratio[0]
             for beacon_ratio in [low_beacon_ratio,high_beacon_ratio]: # NOTE: change high
+                print(f'start offline encoding at {beacon_ratio}')
                 self.memory.reset()
                 self.memory.config.beacon_ratio = [beacon_ratio]
                 self.memory.gt_chunk_idx = ground_truth_pos
