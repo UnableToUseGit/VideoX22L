@@ -2284,8 +2284,12 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                         chunks_total_count = len(record_beacon_activations[high_beacon_ratio][0])
                         all_chunk_idx_list = list(range(chunks_total_count))
                         ground_truth_pos = random.sample(all_chunk_idx_list, count_random)
-                        # ground_truth_pos = all_chunk_idx_list[:1] + all_chunk_idx_list[-1:]
+                        ground_truth_pos = all_chunk_idx_list[:1] + all_chunk_idx_list[-1:]
+                        ground_truth_pos = all_chunk_idx_list[-5:]  # all_chunk_idx_list[-3:] 
+                        
+                        ground_truth_pos = [8,16,24]
                         print(f'random choice gt: {ground_truth_pos}')
+
                         for layer_idx in range(self.memory.config.num_hidden_layers):
                             reload_activations.append( record_beacon_activations[high_beacon_ratio][layer_idx] )
                             if ground_truth_pos is not None:
