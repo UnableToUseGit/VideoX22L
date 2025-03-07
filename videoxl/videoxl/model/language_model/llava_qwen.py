@@ -2285,9 +2285,9 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                         all_chunk_idx_list = list(range(chunks_total_count))
                         ground_truth_pos = random.sample(all_chunk_idx_list, count_random)
                         ground_truth_pos = all_chunk_idx_list[:1] + all_chunk_idx_list[-1:]
-                        ground_truth_pos = all_chunk_idx_list[-5:]  # all_chunk_idx_list[-3:] 
+                        ground_truth_pos = all_chunk_idx_list[-3:]  # all_chunk_idx_list[-5:] 
                         
-                        ground_truth_pos = [8,16,24]
+                        ground_truth_pos = [3,7,11]  # [3,7,11]  [7,15,23]
                         print(f'random choice gt: {ground_truth_pos}')
 
                         for layer_idx in range(self.memory.config.num_hidden_layers):
