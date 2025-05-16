@@ -2096,6 +2096,52 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             result = None
         return result
 
+    def cal_similarity_cross_attn(self, query_embeds, visual_embeds, block_size, topk=3):
+        # Step 1: 提取 query embedding（文本部分）
+        query_embedding = query_embeds
+        QL, D = query_embedding.shape
+
+        # Step 2: 提取视觉部分 embedding
+        visual_embedding_w_time = visual_embeds
+        visual_len = visual_embedding_w_time.size(0)
+
+        # Step 3: 计算视觉 token 与 query 的点积相似度
+        sim = torch.matmul(visual_embedding_w_time, query_embedding.transpose(0, 1))  # shape [B, VL, QL]
+        sim = sim.mean(dim=-1)  # 平均所有 query token → shape [B, VL]
+
+        # Step 4: 遍历每个 block，提取其中的视觉 token 组并计算相似度
+        scores = []
+        
+        # for idx, single_block in enumerate(blocks_positions):
+        for start in range(0, visual_len, block_size):
+            sim_this_block = []
+            end = min(visual_len, start+block_size)
+            for frame_start in range(start, end, 144):
+                frame_end = frame_start + 144
+                frame_sim = sim[frame_start:frame_end]  # shape [group_len]
+                frame_sim = frame_sim.mean()  # 可选：mean/max
+                sim_this_block.append(frame_sim.item())
+
+            # 如果没有有效 group（为空），给一个低分
+            if not sim_this_block:
+                scores.append(-float('inf'))
+            else:
+                # 方式一：用平均值代表 block 分数
+                # block_score = mean(sim_this_block)
+
+                # 方式二：用最大值代表 block 分数（更关注最相关区域）
+                block_score = max(sim_this_block)
+
+                scores.append(block_score)
+
+        # Step 5: 获取 top-k 分数对应的 block indices
+        scores_tensor = torch.tensor(scores, device=query_embeds.device)
+        topk_indices = torch.topk(scores_tensor, k=topk, dim=0, largest=True).indices
+
+        return topk_indices.tolist()
+
+
+
     def _beacon_forward(self, 
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -2115,7 +2161,16 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         gt_frame_idx = None,
         video_id=None
     ):
+        # for ablation
+        if input_ids.shape[-1] != 1:
+            query_embeds = self.model.embed_tokens(input_ids)[:,beacon_skip_last:,:].squeeze(dim=0)
+            visual_embeds = image_features
+            chunk_size = 10 * 144   # 10帧，没帧是144
+            topk = 3
+            ground_truth_pos = self.cal_similarity_cross_attn(query_embeds, visual_embeds, chunk_size, topk=topk)
+            print(f'chunk_size:{chunk_size},topk:{topk},ground_truth_pos:{ground_truth_pos}')
 
+        
         # TODO 推理的时候 保证 ground_truth_pos 为 None，否则 outputs 中会有 loss 这一项，返回回去会报错
         # gt_frame_idx = None
         # if gt_frame_idx is not None and gt_frame_idx[0] is not None: 
@@ -2131,7 +2186,8 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         #     ground_truth_pos = None
 
         # NOTE: qin gt_frame_idx 此时传进去的是 chunk idx，所以直接赋值
-        ground_truth_pos = gt_frame_idx
+        # ground_truth_pos = gt_frame_idx
+
 
         # NOTE: qin EXP 用于模拟更真实的情况
         # if ground_truth_pos is not None:
@@ -2279,17 +2335,6 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                         start = time.time()
                         # 根据 gt chunk 将高密度载入低密度
                         reload_activations = []
-                        
-                        count_random = 3
-                        chunks_total_count = len(record_beacon_activations[high_beacon_ratio][0])
-                        all_chunk_idx_list = list(range(chunks_total_count))
-                        ground_truth_pos = random.sample(all_chunk_idx_list, count_random)
-                        ground_truth_pos = all_chunk_idx_list[:1] + all_chunk_idx_list[-1:]
-                        ground_truth_pos = all_chunk_idx_list[-3:]  # all_chunk_idx_list[-5:] 
-                        
-                        ground_truth_pos = [3,7,11]  # [3,7,11]  [7,15,23]
-                        print(f'random choice gt: {ground_truth_pos}')
-
                         for layer_idx in range(self.memory.config.num_hidden_layers):
                             reload_activations.append( record_beacon_activations[high_beacon_ratio][layer_idx] )
                             if ground_truth_pos is not None:
