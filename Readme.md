@@ -1,11 +1,4 @@
 # Task-Aware KV Compression For Cost-Effective Long Video Understanding
-
-
-
-          
-## 模型权重下载
-
-本方法基于 **Video-XL** 模型，无需额外训练。您可以通过以下链接获取模型权重：[Video_XL](https://huggingface.co/sy1998/Video_XL/tree/main)
         
 ## Installation
 ```bash
