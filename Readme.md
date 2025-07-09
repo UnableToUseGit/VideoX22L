@@ -23,4 +23,4 @@ python inference.py
 ```
 
 ## Reproduce the results of main experiments
-We provide the ''.sh'' scripts to reproduce the results in ``../lmms-eval/scripts/mainexps/``. You could find scripts with different ''top-k'' in this directory for each benchmark.
+We provide the ''.sh'' scripts to reproduce the results of main experiments in ``../lmms-eval/scripts/mainexps/``. You could find scripts with different ''top-k'' in this directory for each benchmark.
